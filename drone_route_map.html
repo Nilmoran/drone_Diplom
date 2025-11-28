@@ -104,341 +104,418 @@
             const initialCenterLon = JSON.parse('37.6173');
             const initialZoom = JSON.parse('12');
             
-            if (typeof mapgl === 'undefined' || !twoGisApiKey) { 
-                alert("Map initialization error."); 
-                return; 
-            }
-            
-            const map = new mapgl.Map('map', { 
-                center: [initialCenterLon, initialCenterLat], 
-                zoom: initialZoom, 
-                key: twoGisApiKey 
-            });
-            
-            const operatorColors = {
-                'MTS': '#e60000', 'Beeline': '#ffdd00', 
-                'Megafon': '#00b550', 'Tele2': '#1f1f1f', 'default': '#808080'
-            };
-            
-            let droneLocation = null, endPoint = null, droneMarker = null, endMarker = null, routeLine = null;
-            let stationMarkers = [], stationCircles = [], stationsVisible = true;
-            let intersectionMarkers = [], warningCircles = [], currentRouteWaypoints = [];
-            let socket = null;
-            
-            // DOM elements
-            const resetButton = document.getElementById('resetButton');
-            const startDemoButton = document.getElementById('startDemoButton');
-            const toggleStationsButton = document.getElementById('toggleStationsButton');
-            const pointA_coords = document.getElementById('pointA_coords');
-            const pointB_coords = document.getElementById('pointB_coords');
-            const route_length_span = document.getElementById('route_length');
-            const maneuvers_list = document.getElementById('maneuvers_list');
-            const intersection_count_span = document.getElementById('intersection_count');
-            const intersection_points_list = document.getElementById('intersection_points_list');
-            const server_status_span = document.getElementById('server_status');
-            const stations_list_elem = document.getElementById('stations_list');
-            const signal_bar = document.getElementById('signal_bar');
-            const active_stations = document.getElementById('active_stations');
-            
-            // Utility functions
-            function toRadians(d) { return d * Math.PI / 180; }
-            
-            function calculateDistanceMeters(lat1, lon1, lat2, lon2) { 
-                const R = 6371000;
-                const dLat = toRadians(lat2 - lat1);
-                const dLon = toRadians(lon2 - lon1);
-                const a = Math.sin(dLat / 2)**2 + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2)**2;
-                return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-            }
-            
-            function isPointInCircle(pLat, pLon, cLat, cLon, cRad) { 
-                return calculateDistanceMeters(pLat, pLon, cLat, cLon) <= cRad; 
-            }
-            
-            const STATION_VISIBILITY_RADIUS = 150; // meters
-            
-            function renderStationsNearDrone() { 
-                stationMarkers.forEach(m => m.destroy()); 
-                stationCircles.forEach(c => c.destroy()); 
-                stationMarkers = []; 
-                stationCircles = []; 
-                stations_list_elem.innerHTML = ''; 
-                
-                const nearbyStations = droneLocation 
-                    ? stationsData.filter(s => calculateDistanceMeters(droneLocation.lat, droneLocation.lon, s.lat, s.lon) <= STATION_VISIBILITY_RADIUS)
-                    : [];
-                
-                nearbyStations.forEach(s => { 
-                    const color = operatorColors[s.operator] || operatorColors['default']; 
-                    stationMarkers.push(new mapgl.Marker(map, { 
-                        coordinates: [s.lon, s.lat], 
-                        label: { text: `📡 ${s.id} (${s.operator})`, color: color, fontSize: 12, stroke: 'white' } 
-                    })); 
-                    stationCircles.push(new mapgl.Circle(map, { 
-                        coordinates: [s.lon, s.lat], 
-                        radius: s.radius, 
-                        color: 'rgba(100, 150, 255, 0.1)', 
-                        stroke: color, 
-                        strokeWidth: 2,
-                        interactive: false 
-                    })); 
-                    const li = document.createElement('li'); 
-                    li.innerHTML = `<span style="color: ${color}; font-weight: bold;">●</span> ID ${s.id} (${s.operator}) - ${s.radius}m`; 
-                    stations_list_elem.appendChild(li); 
-                }); 
-                toggleStationsButton.textContent = 'Hide Stations'; 
-            }
-            
-            function renderRouteLine(coords) { 
-                if (routeLine) routeLine.destroy(); 
-                routeLine = new mapgl.Polyline(map, { 
-                    coordinates: coords, 
-                    width: 5, 
-                    color: '#00aaff',
-                    dashArray: [10, 5]
-                }); 
-            }
-            
-            function renderManeuvers(maneuvers) { 
-                maneuvers_list.innerHTML = maneuvers?.length 
-                    ? maneuvers.map(m => `<li>➤ ${m.comment}</li>`).join('') 
-                    : '<li>No route</li>'; 
-            }
-            
-            function analyzeRouteForIntersections(routePoints, stations) { 
-                const results = []; 
-                routePoints.forEach(p => { 
-                    const coveredBy = stations.filter(s => isPointInCircle(p.lat, p.lon, s.lat, s.lon, s.radius)).map(s => s.id); 
-                    if (coveredBy.length > 1) results.push({ ...p, covered_by: coveredBy }); 
-                }); 
-                return results; 
-            }
-            
-            function renderIntersectionPoints(points) { 
-                intersectionMarkers.forEach(m => m.destroy()); 
-                intersectionMarkers = points.map(p => new mapgl.Circle(map, { 
-                    coordinates: [p.lon, p.lat], 
-                    radius: 8, 
-                    color: 'rgba(0, 255, 100, 0.7)' 
-                })); 
-                intersection_count_span.textContent = points.length; 
-                intersection_points_list.innerHTML = points.length 
-                    ? points.map(p => `<li>(${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}) - Stations: [${p.covered_by.join(',')}]</li>`).join('') 
-                    : ''; 
-            }
-            
-            async function fetchRoute(start, finish) { 
-                try { 
-                    const res = await fetch(`https://routing.api.2gis.com/routing/7.0.0/global?key=${twoGisApiKey}`, { 
-                        method: "POST", 
-                        headers: { "Content-Type": "application/json" }, 
-                        body: JSON.stringify({ 
-                            points: [{ lon: start.lon, lat: start.lat }, { lon: finish.lon, lat: finish.lat }], 
-                            transport: "driving", 
-                            output: "detailed" 
-                        }) 
-                    }); 
-                    
-                    if (!res.ok) { 
-                        const err = await res.json().catch(() => null); 
-                        throw new Error(err?.error?.message || `HTTP ${res.status}`); 
-                    } 
-                    
-                    const parsed = await res.json(); 
-                    if (!parsed?.result?.[0]) throw new Error("API returned empty result."); 
-                    
-                    const routeData = parsed.result[0]; 
-                    const coords = routeData.maneuvers.flatMap(m => 
-                        m.outcoming_path?.geometry?.flatMap(g => 
-                            g.selection.replace(/LINESTRING\(|\)/g, "").split(',').map(pStr => { 
-                                const p = pStr.trim().split(" ").map(Number); 
-                                return (p.length === 2 && !isNaN(p[0])) ? { lon: p[0], lat: p[1] } : null; 
-                            }).filter(Boolean)
-                        ) || []
-                    ); 
-                    
-                    if (coords.length > 0) { 
-                        currentRouteWaypoints = coords;
-                        renderRouteLine(coords.map(c => [c.lon, c.lat])); 
-                        renderManeuvers(routeData.maneuvers); 
-                        route_length_span.textContent = `${(routeData.total_distance / 1000).toFixed(2)} km`; 
-                        renderIntersectionPoints(analyzeRouteForIntersections(coords, stationsData)); 
-                        
-                        // Send route to server for drone navigation
-                        if (socket && socket.readyState === WebSocket.OPEN) {
-                            socket.send(JSON.stringify({
-                                type: 'set_route',
-                                payload: { waypoints: coords }
-                            }));
-                        }
-                    } 
-                } catch (err) { 
-                    console.error('Route error:', err);
-                    alert(`Route error: ${err.message}`); 
-                } 
-            }
-            
-            function updateDroneLocation(lat, lon, signalQuality, stationsUsed) { 
-                clearWarningCircles(); 
-                droneLocation = { lat, lon }; 
-                pointA_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
-                
-                // Update signal bar
-                signal_bar.style.width = `${signalQuality || 0}%`;
-                signal_bar.style.background = signalQuality > 60 
-                    ? 'linear-gradient(90deg, #00cc66, #66ff99)' 
-                    : signalQuality > 30 
-                        ? 'linear-gradient(90deg, #ffaa00, #ffcc00)'
-                        : 'linear-gradient(90deg, #ff4444, #ff6666)';
-                
-                // Update active stations
-                if (stationsUsed && stationsUsed.length > 0) {
-                    active_stations.textContent = stationsUsed.join(', ');
-                }
-                
-                if (!droneMarker) { 
-                    droneMarker = new mapgl.Marker(map, { 
-                        coordinates: [lon, lat], 
-                        icon: './icons/drone.png', 
-                        size: [48, 48] 
-                    }); 
-                } else { 
-                    droneMarker.setCoordinates([lon, lat]); 
-                } 
-                
-                // Smooth camera follow
-                map.setCenter([lon, lat], { duration: 300 });
-                
-                // Update visible stations near drone
-                if (stationsVisible) {
-                    renderStationsNearDrone();
-                }
-            }
-            
-            function clearWarningCircles() { 
-                warningCircles.forEach(c => c.destroy()); 
-                warningCircles = []; 
-            }
-            
-            // WebSocket connection
-            function connectWebSocket() {
-                socket = new WebSocket('ws://localhost:8765');
-                
-                socket.onopen = () => { 
-                    server_status_span.textContent = "Connected"; 
-                    server_status_span.className = "status-connected"; 
-                };
-                
-                socket.onmessage = (event) => { 
-                    const data = JSON.parse(event.data); 
-                    
-                    if (data.type === 'location_update') { 
-                        if (data.payload.lat && data.payload.lon) { 
-                            updateDroneLocation(
-                                data.payload.lat, 
-                                data.payload.lon,
-                                data.payload.signal_quality,
-                                data.payload.stations_used
-                            ); 
-                        } 
-                    } else if (data.type === 'warning_low_signal') { 
-                        clearWarningCircles(); 
-                        data.payload.forEach(t => warningCircles.push(new mapgl.Circle(map, { 
-                            coordinates: [t.lon, t.lat], 
-                            radius: t.radius, 
-                            color: 'rgba(255, 165, 0, 0.2)', 
-                            stroke: 'orange', 
-                            strokeWidth: 3 
-                        }))); 
-                    } 
-                };
-                
-                socket.onclose = () => { 
-                    server_status_span.textContent = "Disconnected"; 
-                    server_status_span.className = "status-disconnected";
-                    // Reconnect after 3 seconds
-                    setTimeout(connectWebSocket, 3000);
-                };
-                
-                socket.onerror = () => { 
-                    server_status_span.textContent = "Error"; 
-                    server_status_span.className = "status-disconnected"; 
-                };
-            }
-            
-            connectWebSocket();
-            
-            // Event handlers
-            map.on('click', (event) => { 
-                const [lon, lat] = event.lngLat; 
-                endPoint = { lon, lat }; 
-                
-                if (endMarker) endMarker.destroy(); 
-                endMarker = new mapgl.Marker(map, { 
-                    coordinates: [lon, lat], 
-                    icon: './icons/finish.svg', 
-                    size: [36, 36], 
-                    anchor: [18, 36], 
-                    label: { text: '🎯 Destination', color: '#ff4444', fontSize: 12 } 
-                }); 
-                
-                pointB_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
-                
-                if (droneLocation && calculateDistanceMeters(droneLocation.lat, droneLocation.lon, endPoint.lat, endPoint.lon) > 10) { 
-                    fetchRoute(droneLocation, endPoint); 
-                } 
-            });
-            
-            startDemoButton.addEventListener('click', () => {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify({ type: 'start_demo' }));
-                }
-            });
-            
-            resetButton.addEventListener('click', () => { 
-                droneLocation = null; 
-                endPoint = null; 
-                currentRouteWaypoints = [];
-                
-                if (droneMarker) droneMarker.destroy(); 
-                if (endMarker) endMarker.destroy(); 
-                if (routeLine) routeLine.destroy(); 
-                intersectionMarkers.forEach(m => m.destroy()); 
-                clearWarningCircles(); 
-                
-                droneMarker = endMarker = routeLine = null; 
-                intersectionMarkers = []; 
-                
-                pointA_coords.textContent = 'Waiting...'; 
-                pointB_coords.textContent = 'Not set'; 
-                route_length_span.textContent = '0 m'; 
-                maneuvers_list.innerHTML = '<li>No route</li>'; 
-                intersection_count_span.textContent = '0'; 
-                intersection_points_list.innerHTML = ''; 
-                signal_bar.style.width = '0%';
-                active_stations.textContent = '-';
-                
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify({ type: 'stop' }));
-                }
-            });
-            
-            toggleStationsButton.addEventListener('click', () => { 
-                stationsVisible = !stationsVisible; 
-                if (stationsVisible) {
-                    renderStationsNearDrone();
+            // Wait for mapgl library to load
+            function waitForMapgl(callback, maxAttempts = 50) {
+                if (typeof mapgl !== 'undefined' && mapgl.Map) {
+                    callback();
+                } else if (maxAttempts > 0) {
+                    setTimeout(() => waitForMapgl(callback, maxAttempts - 1), 100);
                 } else {
-                    stationMarkers.forEach(m => m.destroy());
-                    stationCircles.forEach(c => c.destroy());
-                    stationMarkers = [];
-                    stationCircles = [];
+                    alert("Map initialization error: 2GIS mapgl library failed to load. Please check your internet connection and refresh the page.");
                 }
-                toggleStationsButton.textContent = stationsVisible ? 'Hide Stations' : 'Show Stations'; 
-            });
+            }
             
-            // Initial render (empty until drone position is known)
-            renderStationsNearDrone();
-        });
+            waitForMapgl(() => {
+                if (!twoGisApiKey || twoGisApiKey.trim() === '') {
+                    alert("Map initialization error: API key is missing or invalid.");
+                    return;
+                }
+                
+                let map;
+                try {
+                    console.log('Initializing map with center:', initialCenterLat, initialCenterLon);
+                    map = new mapgl.Map('map', { 
+                        center: [initialCenterLon, initialCenterLat], 
+                        zoom: initialZoom, 
+                        key: twoGisApiKey 
+                    });
+                    console.log('Map initialized successfully');
+                    
+                    // Add map load event listener
+                    map.on('load', () => {
+                        console.log('Map loaded and ready');
+                    });
+                } catch (error) {
+                    alert("Map initialization error: " + error.message);
+                    console.error("Map initialization error:", error);
+                    return;
+                }
+                
+                const operatorColors = {
+                    'MTS': '#e60000', 'Beeline': '#ffdd00', 
+                    'Megafon': '#00b550', 'Tele2': '#1f1f1f', 'default': '#808080'
+                };
+                
+                let droneLocation = null, endPoint = null, droneMarker = null, endMarker = null, routeLine = null;
+                let stationMarkers = [], stationCircles = [], stationsVisible = true;
+                let intersectionMarkers = [], warningCircles = [], currentRouteWaypoints = [];
+                let socket = null;
+                
+                // DOM elements
+                const resetButton = document.getElementById('resetButton');
+                const startDemoButton = document.getElementById('startDemoButton');
+                const toggleStationsButton = document.getElementById('toggleStationsButton');
+                const pointA_coords = document.getElementById('pointA_coords');
+                const pointB_coords = document.getElementById('pointB_coords');
+                const route_length_span = document.getElementById('route_length');
+                const maneuvers_list = document.getElementById('maneuvers_list');
+                const intersection_count_span = document.getElementById('intersection_count');
+                const intersection_points_list = document.getElementById('intersection_points_list');
+                const server_status_span = document.getElementById('server_status');
+                const stations_list_elem = document.getElementById('stations_list');
+                const signal_bar = document.getElementById('signal_bar');
+                const active_stations = document.getElementById('active_stations');
+                
+                // Utility functions
+                function toRadians(d) { return d * Math.PI / 180; }
+                
+                function calculateDistanceMeters(lat1, lon1, lat2, lon2) { 
+                    const R = 6371000;
+                    const dLat = toRadians(lat2 - lat1);
+                    const dLon = toRadians(lon2 - lon1);
+                    const a = Math.sin(dLat / 2)**2 + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2)**2;
+                    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+                }
+                
+                function isPointInCircle(pLat, pLon, cLat, cLon, cRad) { 
+                    return calculateDistanceMeters(pLat, pLon, cLat, cLon) <= cRad; 
+                }
+                
+                const STATION_VISIBILITY_RADIUS = 150; // meters
+                
+                function renderStationsNearDrone() { 
+                    stationMarkers.forEach(m => m.destroy()); 
+                    stationCircles.forEach(c => c.destroy()); 
+                    stationMarkers = []; 
+                    stationCircles = []; 
+                    stations_list_elem.innerHTML = ''; 
+                    
+                    const nearbyStations = droneLocation 
+                        ? stationsData.filter(s => calculateDistanceMeters(droneLocation.lat, droneLocation.lon, s.lat, s.lon) <= STATION_VISIBILITY_RADIUS)
+                        : [];
+                    
+                    nearbyStations.forEach(s => { 
+                        const color = operatorColors[s.operator] || operatorColors['default']; 
+                        stationMarkers.push(new mapgl.Marker(map, { 
+                            coordinates: [s.lon, s.lat], 
+                            label: { text: `📡 ${s.id} (${s.operator})`, color: color, fontSize: 12, stroke: 'white' } 
+                        })); 
+                        stationCircles.push(new mapgl.Circle(map, { 
+                            coordinates: [s.lon, s.lat], 
+                            radius: s.radius, 
+                            color: 'rgba(100, 150, 255, 0.1)', 
+                            stroke: color, 
+                            strokeWidth: 2,
+                            interactive: false 
+                        })); 
+                        const li = document.createElement('li'); 
+                        li.innerHTML = `<span style="color: ${color}; font-weight: bold;">●</span> ID ${s.id} (${s.operator}) - ${s.radius}m`; 
+                        stations_list_elem.appendChild(li); 
+                    }); 
+                    toggleStationsButton.textContent = 'Hide Stations'; 
+                }
+                
+                function renderRouteLine(coords) { 
+                    if (routeLine) routeLine.destroy(); 
+                    routeLine = new mapgl.Polyline(map, { 
+                        coordinates: coords, 
+                        width: 5, 
+                        color: '#00aaff',
+                        dashArray: [10, 5]
+                    }); 
+                }
+                
+                function renderManeuvers(maneuvers) { 
+                    maneuvers_list.innerHTML = maneuvers?.length 
+                        ? maneuvers.map(m => `<li>➤ ${m.comment}</li>`).join('') 
+                        : '<li>No route</li>'; 
+                }
+                
+                function analyzeRouteForIntersections(routePoints, stations) { 
+                    const results = []; 
+                    routePoints.forEach(p => { 
+                        const coveredBy = stations.filter(s => isPointInCircle(p.lat, p.lon, s.lat, s.lon, s.radius)).map(s => s.id); 
+                        if (coveredBy.length > 1) results.push({ ...p, covered_by: coveredBy }); 
+                    }); 
+                    return results; 
+                }
+                
+                function renderIntersectionPoints(points) { 
+                    intersectionMarkers.forEach(m => m.destroy()); 
+                    intersectionMarkers = points.map(p => new mapgl.Circle(map, { 
+                        coordinates: [p.lon, p.lat], 
+                        radius: 8, 
+                        color: 'rgba(0, 255, 100, 0.7)' 
+                    })); 
+                    intersection_count_span.textContent = points.length; 
+                    intersection_points_list.innerHTML = points.length 
+                        ? points.map(p => `<li>(${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}) - Stations: [${p.covered_by.join(',')}]</li>`).join('') 
+                        : ''; 
+                }
+                
+                async function fetchRoute(start, finish) { 
+                    try { 
+                        const res = await fetch(`https://routing.api.2gis.com/routing/7.0.0/global?key=${twoGisApiKey}`, { 
+                            method: "POST", 
+                            headers: { "Content-Type": "application/json" }, 
+                            body: JSON.stringify({ 
+                                points: [{ lon: start.lon, lat: start.lat }, { lon: finish.lon, lat: finish.lat }], 
+                                transport: "driving", 
+                                output: "detailed" 
+                            }) 
+                        }); 
+                        
+                        if (!res.ok) { 
+                            const err = await res.json().catch(() => null); 
+                            throw new Error(err?.error?.message || `HTTP ${res.status}`); 
+                        } 
+                        
+                        const parsed = await res.json(); 
+                        if (!parsed?.result?.[0]) throw new Error("API returned empty result."); 
+                        
+                        const routeData = parsed.result[0]; 
+                        const coords = routeData.maneuvers.flatMap(m => 
+                            m.outcoming_path?.geometry?.flatMap(g => 
+                                g.selection.replace(/LINESTRING\(|\)/g, "").split(',').map(pStr => { 
+                                    const p = pStr.trim().split(" ").map(Number); 
+                                    return (p.length === 2 && !isNaN(p[0])) ? { lon: p[0], lat: p[1] } : null; 
+                                }).filter(Boolean)
+                            ) || []
+                        ); 
+                        
+                        if (coords.length > 0) { 
+                            currentRouteWaypoints = coords;
+                            renderRouteLine(coords.map(c => [c.lon, c.lat])); 
+                            renderManeuvers(routeData.maneuvers); 
+                            route_length_span.textContent = `${(routeData.total_distance / 1000).toFixed(2)} km`; 
+                            renderIntersectionPoints(analyzeRouteForIntersections(coords, stationsData)); 
+                            
+                            // Send route to server for drone navigation
+                            // This will update the route even if drone is currently flying
+                            if (socket && socket.readyState === WebSocket.OPEN) {
+                                socket.send(JSON.stringify({
+                                    type: 'set_route',
+                                    payload: { waypoints: coords }
+                                }));
+                                console.log(`Route sent to server: ${coords.length} waypoints`);
+                            } else {
+                                console.warn('WebSocket not connected, route not sent to server');
+                                alert('Warning: WebSocket not connected. Route displayed but not sent to drone. Please check connection.');
+                            }
+                        } else {
+                            console.error('Route API returned empty coordinates');
+                            alert('Error: Could not generate route. Please try selecting a different destination.');
+                        } 
+                    } catch (err) { 
+                        console.error('Route error:', err);
+                        alert(`Route error: ${err.message}`); 
+                    } 
+                }
+                
+                function updateDroneLocation(lat, lon, signalQuality, stationsUsed) { 
+                    clearWarningCircles(); 
+                    droneLocation = { lat, lon }; 
+                    pointA_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
+                    
+                    // Update signal bar
+                    signal_bar.style.width = `${signalQuality || 0}%`;
+                    signal_bar.style.background = signalQuality > 60 
+                        ? 'linear-gradient(90deg, #00cc66, #66ff99)' 
+                        : signalQuality > 30 
+                            ? 'linear-gradient(90deg, #ffaa00, #ffcc00)'
+                            : 'linear-gradient(90deg, #ff4444, #ff6666)';
+                    
+                    // Update active stations
+                    if (stationsUsed && stationsUsed.length > 0) {
+                        active_stations.textContent = stationsUsed.join(', ');
+                    }
+                    
+                    if (!droneMarker) { 
+                        droneMarker = new mapgl.Marker(map, { 
+                            coordinates: [lon, lat], 
+                            icon: './icons/drone.png', 
+                            size: [48, 48] 
+                        }); 
+                    } else { 
+                        droneMarker.setCoordinates([lon, lat]); 
+                    } 
+                    
+                    // Smooth camera follow
+                    map.setCenter([lon, lat], { duration: 300 });
+                    
+                    // Update visible stations near drone
+                    if (stationsVisible) {
+                        renderStationsNearDrone();
+                    }
+                }
+                
+                function clearWarningCircles() { 
+                    warningCircles.forEach(c => c.destroy()); 
+                    warningCircles = []; 
+                }
+                
+                // WebSocket connection
+                function connectWebSocket() {
+                    console.log('Attempting to connect to WebSocket server...');
+                    try {
+                        socket = new WebSocket('ws://localhost:8765');
+                        
+                        socket.onopen = () => { 
+                            console.log('WebSocket connected successfully');
+                            server_status_span.textContent = "Connected"; 
+                            server_status_span.className = "status-connected"; 
+                        };
+                        
+                        socket.onmessage = (event) => { 
+                            try {
+                                const data = JSON.parse(event.data); 
+                                
+                                if (data.type === 'location_update') { 
+                                    if (data.payload.lat && data.payload.lon) { 
+                                        updateDroneLocation(
+                                            data.payload.lat, 
+                                            data.payload.lon,
+                                            data.payload.signal_quality,
+                                            data.payload.stations_used
+                                        ); 
+                                    } 
+                                } else if (data.type === 'warning_low_signal') { 
+                                    clearWarningCircles(); 
+                                    data.payload.forEach(t => warningCircles.push(new mapgl.Circle(map, { 
+                                        coordinates: [t.lon, t.lat], 
+                                        radius: t.radius, 
+                                        color: 'rgba(255, 165, 0, 0.2)', 
+                                        stroke: 'orange', 
+                                        strokeWidth: 3 
+                                    }))); 
+                                }
+                            } catch (err) {
+                                console.error('Error parsing WebSocket message:', err);
+                            }
+                        };
+                        
+                        socket.onclose = (event) => { 
+                            console.log('WebSocket closed:', event.code, event.reason);
+                            server_status_span.textContent = "Disconnected"; 
+                            server_status_span.className = "status-disconnected";
+                            // Reconnect after 3 seconds
+                            setTimeout(connectWebSocket, 3000);
+                        };
+                        
+                        socket.onerror = (error) => { 
+                            console.error('WebSocket error:', error);
+                            server_status_span.textContent = "Connection Error"; 
+                            server_status_span.className = "status-disconnected"; 
+                        };
+                    } catch (error) {
+                        console.error('Failed to create WebSocket:', error);
+                        server_status_span.textContent = "Connection Failed"; 
+                        server_status_span.className = "status-disconnected";
+                        // Retry after 3 seconds
+                        setTimeout(connectWebSocket, 3000);
+                    }
+                }
+                
+                connectWebSocket();
+                
+                // Event handlers
+                map.on('click', (event) => { 
+                    const [lon, lat] = event.lngLat; 
+                    endPoint = { lon, lat }; 
+                    
+                    if (endMarker) endMarker.destroy(); 
+                    endMarker = new mapgl.Marker(map, { 
+                        coordinates: [lon, lat], 
+                        icon: './icons/finish.svg', 
+                        size: [36, 36], 
+                        anchor: [18, 36], 
+                        label: { text: '🎯 Destination', color: '#ff4444', fontSize: 12 } 
+                    }); 
+                    
+                    pointB_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
+                    
+                    // FIXED: Always allow route setting, with intelligent fallback
+                    // Use current drone location if available, otherwise use route start or map center
+                    let routeStart = null;
+                    
+                    if (droneLocation) {
+                        // Use current drone position
+                        routeStart = droneLocation;
+                    } else if (currentRouteWaypoints && currentRouteWaypoints.length > 0) {
+                        // Use start of current route if drone position not yet available
+                        routeStart = currentRouteWaypoints[0];
+                        console.log('Using route start as fallback for route calculation');
+                    } else {
+                        // Use map center as last resort
+                        const center = map.getCenter();
+                        routeStart = { lat: center[1], lon: center[0] };
+                        console.log('Using map center as fallback for route calculation');
+                    }
+                    
+                    // Check distance - reduced threshold from 10m to 1m to allow closer waypoints
+                    const distance = calculateDistanceMeters(routeStart.lat, routeStart.lon, endPoint.lat, endPoint.lon);
+                    
+                    if (distance > 1.0) {
+                        // Fetch route from start point to destination
+                        fetchRoute(routeStart, endPoint);
+                    } else {
+                        // Points are too close - provide user feedback
+                        console.warn('Destination too close to start point (< 1m), route not fetched');
+                        alert('Destination is too close to the start point. Please select a destination further away.');
+                    }
+                });
+                
+                startDemoButton.addEventListener('click', () => {
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'start_demo' }));
+                    }
+                });
+                
+                resetButton.addEventListener('click', () => { 
+                    droneLocation = null; 
+                    endPoint = null; 
+                    currentRouteWaypoints = [];
+                    
+                    if (droneMarker) droneMarker.destroy(); 
+                    if (endMarker) endMarker.destroy(); 
+                    if (routeLine) routeLine.destroy(); 
+                    intersectionMarkers.forEach(m => m.destroy()); 
+                    clearWarningCircles(); 
+                    
+                    droneMarker = endMarker = routeLine = null; 
+                    intersectionMarkers = []; 
+                    
+                    pointA_coords.textContent = 'Waiting...'; 
+                    pointB_coords.textContent = 'Not set'; 
+                    route_length_span.textContent = '0 m'; 
+                    maneuvers_list.innerHTML = '<li>No route</li>'; 
+                    intersection_count_span.textContent = '0'; 
+                    intersection_points_list.innerHTML = ''; 
+                    signal_bar.style.width = '0%';
+                    active_stations.textContent = '-';
+                    
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'stop' }));
+                    }
+                });
+                
+                toggleStationsButton.addEventListener('click', () => { 
+                    stationsVisible = !stationsVisible; 
+                    if (stationsVisible) {
+                        renderStationsNearDrone();
+                    } else {
+                        stationMarkers.forEach(m => m.destroy());
+                        stationCircles.forEach(c => c.destroy());
+                        stationMarkers = [];
+                        stationCircles = [];
+                    }
+                    toggleStationsButton.textContent = stationsVisible ? 'Hide Stations' : 'Show Stations'; 
+                });
+                
+                // Initial render (empty until drone position is known)
+                renderStationsNearDrone();
+            }); // End of waitForMapgl callback
+        }); // End of DOMContentLoaded
     </script>
 </body>
 </html>
