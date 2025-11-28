@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <title>Навигатор для дрона</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://mapgl.2gis.com/api/js/v1"></script> 
+    <style>
+        /* Стили */
+        html, body, #map { margin: 0; padding: 0; width: 100%; height: 100vh; overflow: hidden; }
+        .info-box { position: absolute; top: 10px; left: 10px; background: rgba(255, 255, 255, 0.9); padding: 10px; border-radius: 5px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); z-index: 1000; max-width: 380px; font-family: sans-serif; font-size: 14px; color: #333; max-height: calc(100% - 20px); overflow-y: auto; }
+        .info-box ul { list-style-type: none; padding-left: 0; margin-top: 5px; }
+        .controls-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; }
+        .button-group { display: flex; gap: 5px; margin-bottom: 10px; }
+        .button-group button { padding: 5px 10px; font-size: 14px; border: none; border-radius: 5px; background-color: #0078FF; color: white; cursor: pointer; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3); }
+        .simulator { border: 1px solid #ccc; padding: 8px; border-radius: 5px; background: #f9f9f9; }
+        .simulator input { width: 120px; margin-right: 5px; padding: 4px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-box">
+        <h3>Навигатор для дрона</h3>
+        <p><b>Инструкция:</b> Кликните на карту, чтобы выбрать пункт назначения (Б). Затем используйте симулятор для обновления положения дрона (А).</p>
+        
+        <div class="controls-section simulator">
+            <b>Симулятор положения дрона:</b>
+            <div>
+                <input type="text" id="latInput" placeholder="Широта (напр. 55.75)">
+                <input type="text" id="lonInput" placeholder="Долгота (напр. 37.61)">
+            </div>
+            <button id="updateLocationButton" style="width: 100%; margin-top: 5px;">Обновить положение (А)</button>
+        </div>
+
+        <div class="controls-section button-group">
+            <button id="resetButton">Сбросить маршрут</button>
+            <button id="toggleStationsButton">Скрыть станции</button>
+        </div>
+
+        <p><b>Положение дрона (А):</b> <span id="pointA_coords">Ожидание координат...</span></p>
+        <p><b>Пункт назначения (Б):</b> <span id="pointB_coords">Не выбран</span></p>
+        <p><b>Общая длина маршрута:</b> <span id="route_length">0 м</span></p>
+        
+        <p><b>Точек маршрута в зонах пересечения:</b> <span id="intersection_count">0</span></p>
+        <p><b>Координаты в зонах пересечения:</b></p>
+        <ul id="intersection_points_list"></ul>
+
+        <p><b>Инструкции по маршруту:</b></p>
+        <ul id="maneuvers_list"><li>Нет маршрута</li></ul>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const stationsData = JSON.parse('{{ stations | tojson | safe }}');
+            const twoGisApiKey = JSON.parse('{{ two_gis_api_key | tojson | safe }}');
+            const initialCenterLat = JSON.parse('{{ initial_center_lat | tojson | safe }}');
+            const initialCenterLon = JSON.parse('{{ initial_center_lon | tojson | safe }}');
+            const initialZoom = JSON.parse('{{ initial_zoom | tojson | safe }}');
+
+            const map = new mapgl.Map('map', { center: [initialCenterLon, initialCenterLat], zoom: initialZoom, key: twoGisApiKey });
+            
+            let droneLocation = null, endPoint = null;
+            let droneMarker = null, endMarker = null, routeLine = null;
+            let intersectionMarkers = [];
+            
+            const resetButton = document.getElementById('resetButton');
+            const updateLocationButton = document.getElementById('updateLocationButton');
+            const pointA_coords = document.getElementById('pointA_coords');
+            const pointB_coords = document.getElementById('pointB_coords');
+            const route_length_span = document.getElementById('route_length');
+            const maneuvers_list = document.getElementById('maneuvers_list');
+            const intersection_count_span = document.getElementById('intersection_count');
+            const intersection_points_list = document.getElementById('intersection_points_list');
+
+            function toRadians(degrees) { return degrees * Math.PI / 180; }
+            function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
+                const R = 6371000;
+                const dLat = toRadians(lat2 - lat1);
+                const dLon = toRadians(lon2 - lon1);
+                const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+                return R * c;
+            }
+
+            function renderRouteLine(coordinates) {
+                if (routeLine) routeLine.destroy();
+                routeLine = new mapgl.Polyline(map, { coordinates, width: 6, color: '#0055ff', cap: 'round', join: 'round' });
+            }
+            function renderManeuvers(maneuvers) {
+                maneuvers_list.innerHTML = maneuvers && maneuvers.length > 0 ? maneuvers.map(m => `<li>${m.comment}</li>`).join('') : '<li>Инструкции отсутствуют.</li>';
+            }
+            function isPointInCircle(pointLat, pointLon, circleLat, circleLon, circleRadius) {
+                return calculateDistanceMeters(pointLat, pointLon, circleLat, circleLon) <= circleRadius;
+            }
+            function analyzeRouteForIntersections(routePoints, stations) {
+                const intersectionPointsOnRoute = [];
+                routePoints.forEach(point => {
+                    const coveredByStations = stations.filter(station => isPointInCircle(point.lat, point.lon, station.lat, station.lon, station.radius)).map(s => s.id);
+                    if (coveredByStations.length > 1) {
+                        intersectionPointsOnRoute.push({ ...point, covered_by: coveredByStations });
+                    }
+                });
+                return intersectionPointsOnRoute;
+            }
+            function renderIntersectionPoints(points) {
+                intersectionMarkers.forEach(marker => marker.destroy());
+                intersectionMarkers = points.map(point => new mapgl.Circle(map, {
+                    coordinates: [point.lon, point.lat],
+                    radius: 5,
+                    color: 'rgba(255, 0, 0, 0.7)',
+                    stroke: 'red',
+                    strokeWidth: 1
+                }));
+                intersection_count_span.textContent = points.length;
+                intersection_points_list.innerHTML = points.length > 0 ? points.map(p => `<li>(${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}) - Ст.: [${p.covered_by.join(', ')}]</li>`).join('') : '<li>Нет.</li>';
+            }
+
+            async function fetchRoute(start, finish) {
+                try {
+                    const reqUrl = `https://routing.api.2gis.com/routing/7.0.0/global?key=${twoGisApiKey}`;
+                    const res = await fetch(reqUrl, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            points: [{ type: "stop", lon: start.lon, lat: start.lat }, { type: "stop", lon: finish.lon, lat: finish.lat }],
+                            locale: "ru",
+                            transport: "driving",
+                            output: "detailed"
+                        })
+                    });
+                    if (!res.ok) {
+                        const errorDetails = await res.json().catch(() => null);
+                        const serverMessage = errorDetails?.error?.message || `HTTP status ${res.status}`;
+                        throw new Error(serverMessage);
+                    }
+                    const parsed = await res.json();
+                    if (!parsed?.result?.[0]) throw new Error("Не удалось построить маршрут, ответ API пуст.");
+
+                    const routeData = parsed.result[0];
+                    const fullRouteCoordinates = routeData.maneuvers.flatMap(m => m.outcoming_path?.geometry?.flatMap(g => g.selection.replace(/LINESTRING\(|\)/g, "").split(',').map(pStr => { const p = pStr.trim().split(" ").map(Number); return (p.length === 2 && !isNaN(p[0])) ? { lon: p[0], lat: p[1] } : null; }).filter(Boolean)) || []);
+
+                    if (fullRouteCoordinates.length > 0) {
+                        renderRouteLine(fullRouteCoordinates.map(p => [p.lon, p.lat]));
+                        renderManeuvers(routeData.maneuvers);
+                        route_length_span.textContent = `${(routeData.total_distance / 1000).toFixed(2)} км`;
+                        const intersectionPoints = analyzeRouteForIntersections(fullRouteCoordinates, stationsData);
+                        renderIntersectionPoints(intersectionPoints);
+                    }
+                } catch (err) {
+                    console.error("Error fetching route:", err);
+                    alert(`Ошибка при построении маршрута: ${err.message}\n\nПопробуйте выбрать точки ближе к дорогам.`);
+                }
+            }
+            
+            // --- ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ ЛОГИКУ ФУНКЦИИ ---
+            function updateDroneLocation(lat, lon) {
+                droneLocation = { lat, lon };
+                pointA_coords.textContent = `(${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+
+                if (!droneMarker) {
+                    droneMarker = new mapgl.Marker(map, {
+                        coordinates: [lon, lat],
+                        icon: './icons/drone.png',
+                        size: [40, 40]
+                    });
+                } else {
+                    droneMarker.setCoordinates([lon, lat]);
+                }
+
+                map.setCenter([lon, lat]);
+                if (map.getZoom() < 15) {
+                    map.setZoom(15);
+                }
+
+                if (endPoint && calculateDistanceMeters(droneLocation.lat, droneLocation.lon, endPoint.lat, endPoint.lon) > 1) {
+                    fetchRoute(droneLocation, endPoint);
+                }
+            }
+            // ---------------------------------------------
+
+            map.on('click', (event) => {
+                const [lon, lat] = event.lngLat;
+                endPoint = { lon, lat };
+                
+                if (endMarker) endMarker.destroy();
+                endMarker = new mapgl.Marker(map, {
+                    coordinates: [lon, lat],
+                    icon: './icons/finish.svg',
+                    size: [32, 32],
+                    anchor: [16, 32],
+                    label: { text: 'Б (Финиш)', color: 'red', fontSize: 16 },
+                });
+                pointB_coords.textContent = `(${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+
+                if (droneLocation && calculateDistanceMeters(droneLocation.lat, droneLocation.lon, endPoint.lat, endPoint.lon) > 1) {
+                    fetchRoute(droneLocation, endPoint);
+                }
+            });
+
+            updateLocationButton.addEventListener('click', () => {
+                const lat = parseFloat(document.getElementById('latInput').value);
+                const lon = parseFloat(document.getElementById('lonInput').value);
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    // Эта функция теперь снова работает
+                    updateDroneLocation(lat, lon);
+                } else {
+                    alert('Пожалуйста, введите корректные числовые координаты.');
+                }
+            });
+            
+            resetButton.addEventListener('click', () => {
+                droneLocation = null; endPoint = null;
+                if (droneMarker) droneMarker.destroy();
+                if (endMarker) endMarker.destroy();
+                if (routeLine) routeLine.destroy();
+                intersectionMarkers.forEach(marker => marker.destroy());
+                
+                droneMarker = endMarker = routeLine = null;
+                intersectionMarkers = [];
+                
+                pointA_coords.textContent = 'Ожидание координат...';
+                pointB_coords.textContent = 'Не выбран';
+                route_length_span.textContent = '0 м';
+                maneuvers_list.innerHTML = '<li>Нет маршрута</li>';
+                intersection_count_span.textContent = '0';
+                intersection_points_list.innerHTML = '';
+            });
+        });
+    </script>
+</body>
+</html>

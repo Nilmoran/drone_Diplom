@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <title>UAV Navigation System</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://mapgl.2gis.com/api/js/v1"></script> 
+    <style>
+        html, body, #map { margin: 0; padding: 0; width: 100%; height: 100vh; overflow: hidden; }
+        .info-box { 
+            position: absolute; top: 10px; left: 10px; 
+            background: rgba(20, 25, 35, 0.95); 
+            padding: 15px; border-radius: 8px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4); 
+            z-index: 1000; max-width: 380px; 
+            font-family: 'Segoe UI', sans-serif; font-size: 13px; 
+            color: #e0e0e0; max-height: calc(100% - 40px); overflow-y: auto;
+            border: 1px solid rgba(100, 150, 255, 0.3);
+        }
+        .info-box h3 { color: #4a9eff; margin: 0 0 10px 0; font-size: 16px; }
+        .info-box ul { list-style-type: none; padding-left: 0; margin: 5px 0; }
+        .info-box li { padding: 2px 0; }
+        .info-box p { margin: 8px 0; }
+        .info-box b { color: #7ab8ff; }
+        .controls-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(100, 150, 255, 0.2); }
+        .button-group { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+        .button-group button { 
+            padding: 8px 14px; font-size: 13px; border: none; border-radius: 6px; 
+            background: linear-gradient(135deg, #0066cc, #0088ff); 
+            color: white; cursor: pointer; 
+            box-shadow: 0 2px 8px rgba(0, 100, 255, 0.3);
+            transition: all 0.2s ease;
+        }
+        .button-group button:hover { 
+            background: linear-gradient(135deg, #0077dd, #0099ff);
+            transform: translateY(-1px);
+        }
+        .button-group button:disabled { background: #444; cursor: not-allowed; }
+        .signal-bar { 
+            height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 5px;
+        }
+        .signal-fill { 
+            height: 100%; background: linear-gradient(90deg, #00cc66, #66ff99); 
+            transition: width 0.3s ease;
+        }
+        .status-connected { color: #00cc66; }
+        .status-disconnected { color: #ff4444; }
+        .status-connecting { color: #ffaa00; }
+        .telemetry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+        .telemetry-item { background: rgba(255,255,255,0.05); padding: 8px; border-radius: 4px; }
+        .telemetry-value { font-size: 16px; font-weight: bold; color: #4a9eff; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="info-box">
+        <h3>🚁 UAV Navigation System</h3>
+        <p><b>Instructions:</b> Click on the map to set destination. The UAV position is calculated via trilateration from LTE base stations.</p>
+        
+        <div class="controls-section">
+            <b>Server Status:</b> <span id="server_status" class="status-connecting">Connecting...</span>
+        </div>
+        
+        <div class="controls-section">
+            <b>LTE Signal Quality:</b>
+            <div class="signal-bar"><div class="signal-fill" id="signal_bar" style="width: 0%"></div></div>
+        </div>
+        
+        <div class="controls-section button-group">
+            <button id="startDemoButton">Start Demo</button>
+            <button id="resetButton">Reset Route</button>
+            <button id="toggleStationsButton">Hide Stations</button>
+        </div>
+        
+        <div class="telemetry-grid">
+            <div class="telemetry-item">
+                <div>UAV Position (A)</div>
+                <div class="telemetry-value" id="pointA_coords">Waiting...</div>
+            </div>
+            <div class="telemetry-item">
+                <div>Destination (B)</div>
+                <div class="telemetry-value" id="pointB_coords">Not set</div>
+            </div>
+        </div>
+        
+        <div class="controls-section">
+            <p><b>Active Base Stations:</b> <span id="active_stations">-</span></p>
+            <p><b>Base Stations:</b></p>
+            <ul id="stations_list"></ul>
+        </div>
+        
+        <p><b>Route Length:</b> <span id="route_length">0 m</span></p>
+        <p><b>Intersection Points:</b> <span id="intersection_count">0</span></p>
+        <ul id="intersection_points_list"></ul>
+        <p><b>Route Instructions:</b></p>
+        <ul id="maneuvers_list"><li>No route</li></ul>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const stationsData = JSON.parse('[{"generation": "4g", "id": 1158, "lat": 55.864986, "lon": 37.465651, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1174, "lat": 55.841218, "lon": 37.438908, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1228, "lat": 55.866805, "lon": 37.509972, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1270, "lat": 55.82677, "lon": 37.451174, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1299, "lat": 55.883581, "lon": 37.444587, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1329, "lat": 55.850359, "lon": 37.444721, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1366, "lat": 55.844684, "lon": 37.485718, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1375, "lat": 55.867024, "lon": 37.50129, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1481, "lat": 55.852494, "lon": 37.494826, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1482, "lat": 55.85364, "lon": 37.53625, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1548, "lat": 55.854447, "lon": 37.504409, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1592, "lat": 55.841169, "lon": 37.489043, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1594, "lat": 55.876502, "lon": 37.524605, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1673, "lat": 55.837814, "lon": 37.453787, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1912, "lat": 55.851558, "lon": 37.438084, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1923, "lat": 55.858637, "lon": 37.448237, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1924, "lat": 55.842264, "lon": 37.460797, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 1929, "lat": 55.874306, "lon": 37.516637, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2026, "lat": 55.885601, "lon": 37.453712, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2137, "lat": 55.854126, "lon": 37.476058, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2160, "lat": 55.861719, "lon": 37.480826, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2202, "lat": 55.819265, "lon": 37.466472, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2214, "lat": 55.881791, "lon": 37.488924, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2215, "lat": 55.850468, "lon": 37.478574, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2404, "lat": 55.858068, "lon": 37.47285, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2460, "lat": 55.833536, "lon": 37.495772, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2685, "lat": 55.870273, "lon": 37.515532, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 2833, "lat": 55.8435, "lon": 37.523998, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3002, "lat": 55.863119, "lon": 37.434748, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3166, "lat": 55.845956, "lon": 37.538673, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3167, "lat": 55.897736, "lon": 37.517401, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3176, "lat": 55.847624, "lon": 37.504654, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3300, "lat": 55.832199, "lon": 37.461621, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3304, "lat": 55.818692, "lon": 37.451883, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3317, "lat": 55.875667, "lon": 37.445552, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3397, "lat": 55.86106, "lon": 37.537492, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3487, "lat": 55.877547, "lon": 37.43281, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3488, "lat": 55.887321, "lon": 37.485286, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3489, "lat": 55.89987, "lon": 37.51512, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3647, "lat": 55.88956, "lon": 37.491509, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3670, "lat": 55.873998, "lon": 37.50676, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3710, "lat": 55.863379, "lon": 37.5074, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3748, "lat": 55.887768, "lon": 37.465016, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3793, "lat": 55.861408, "lon": 37.491702, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3840, "lat": 55.861145, "lon": 37.477441, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3942, "lat": 55.879823, "lon": 37.457577, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 3983, "lat": 55.866305, "lon": 37.49421, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4008, "lat": 55.849372, "lon": 37.543191, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4033, "lat": 55.848517, "lon": 37.454279, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4057, "lat": 55.874021, "lon": 37.505697, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4089, "lat": 55.858678, "lon": 37.491152, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4125, "lat": 55.893643, "lon": 37.502467, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4132, "lat": 55.852399, "lon": 37.446394, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4250, "lat": 55.865219, "lon": 37.467125, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4283, "lat": 55.851134, "lon": 37.467161, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4844, "lat": 55.845699, "lon": 37.443533, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 4954, "lat": 55.862623, "lon": 37.534823, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5177, "lat": 55.879179, "lon": 37.480223, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5434, "lat": 55.866025, "lon": 37.480263, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5503, "lat": 55.858128, "lon": 37.470302, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5511, "lat": 55.85799, "lon": 37.526087, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5512, "lat": 55.7225616, "lon": 37.459518, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5546, "lat": 55.872538, "lon": 37.483624, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5591, "lat": 55.881096, "lon": 37.501197, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5643, "lat": 55.854252, "lon": 37.521703, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 5645, "lat": 55.86958, "lon": 37.504351, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6101, "lat": 55.874774, "lon": 37.486329, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6326, "lat": 55.882893, "lon": 37.466296, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6496, "lat": 55.843466, "lon": 37.49552, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6725, "lat": 55.86499, "lon": 37.516339, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6826, "lat": 55.854472, "lon": 37.479597, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6943, "lat": 55.882991, "lon": 37.443314, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 6997, "lat": 55.865328, "lon": 37.536199, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7059, "lat": 55.854833, "lon": 37.49332, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7463, "lat": 55.879854, "lon": 37.483572, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7487, "lat": 55.854779, "lon": 37.476474, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7520, "lat": 55.878234, "lon": 37.479363, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7521, "lat": 55.879209, "lon": 37.478402, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7857, "lat": 55.826703, "lon": 37.496017, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7858, "lat": 55.856448, "lon": 37.434284, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 7946, "lat": 55.84569, "lon": 37.522053, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8169, "lat": 55.847135, "lon": 37.450107, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8309, "lat": 55.855596, "lon": 37.444994, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8537, "lat": 55.899446, "lon": 37.529652, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8540, "lat": 55.866356, "lon": 37.525438, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8541, "lat": 55.84926, "lon": 37.473693, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8543, "lat": 55.847949, "lon": 37.539212, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8844, "lat": 55.816976, "lon": 37.459338, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8882, "lat": 55.850367, "lon": 37.486201, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8972, "lat": 55.84336, "lon": 37.453916, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 8988, "lat": 55.850532, "lon": 37.508948, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9067, "lat": 55.869481, "lon": 37.494209, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9106, "lat": 55.840383, "lon": 37.517325, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9228, "lat": 55.849177, "lon": 37.444353, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9274, "lat": 55.870698, "lon": 37.531115, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9421, "lat": 55.878863, "lon": 37.512395, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9456, "lat": 55.837425, "lon": 37.442083, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9461, "lat": 55.837596, "lon": 37.440139, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9517, "lat": 55.86873, "lon": 37.45937, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9519, "lat": 55.878305, "lon": 37.496448, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9601, "lat": 55.831982, "lon": 37.455985, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9613, "lat": 55.854155, "lon": 37.451184, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9683, "lat": 55.842536, "lon": 37.483851, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9845, "lat": 55.858397, "lon": 37.482812, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9874, "lat": 55.877972, "lon": 37.4703, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 9994, "lat": 55.847256, "lon": 37.498768, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 10084, "lat": 55.86307, "lon": 37.471472, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 10166, "lat": 55.868377, "lon": 37.530192, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 10463, "lat": 55.84368, "lon": 37.446096, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 10572, "lat": 55.830584, "lon": 37.501665, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 10573, "lat": 55.812984, "lon": 37.475782, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11062, "lat": 55.8701, "lon": 37.489427, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11068, "lat": 55.841808, "lon": 37.489089, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11131, "lat": 55.877671, "lon": 37.467908, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11163, "lat": 55.864035, "lon": 37.498881, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11182, "lat": 55.861527, "lon": 37.523895, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11319, "lat": 55.834893, "lon": 37.447094, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11375, "lat": 55.866156, "lon": 37.467828, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11401, "lat": 55.864585, "lon": 37.523955, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11423, "lat": 55.862644, "lon": 37.448684, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11560, "lat": 55.867164, "lon": 37.446473, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11584, "lat": 55.849989, "lon": 37.525559, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11591, "lat": 55.825676, "lon": 37.448439, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11849, "lat": 55.833122, "lon": 37.470693, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 11876, "lat": 55.888269, "lon": 37.443533, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12017, "lat": 55.863089, "lon": 37.506917, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12018, "lat": 55.872833, "lon": 37.490195, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12279, "lat": 55.872519, "lon": 37.473231, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12456, "lat": 55.829827, "lon": 37.452579, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12923, "lat": 55.865945, "lon": 37.467119, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 12994, "lat": 55.89001, "lon": 37.452265, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13008, "lat": 55.86163, "lon": 37.436155, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13236, "lat": 55.865031, "lon": 37.499277, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13238, "lat": 55.869952, "lon": 37.501226, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13328, "lat": 55.846675, "lon": 37.515753, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13395, "lat": 55.848696, "lon": 37.439189, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13411, "lat": 55.861992, "lon": 37.472079, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13419, "lat": 55.866231, "lon": 37.543586, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13639, "lat": 55.863056, "lon": 37.472741, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13693, "lat": 55.833115, "lon": 37.503757, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 13920, "lat": 55.863422, "lon": 37.478773, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14413, "lat": 55.87938, "lon": 37.507001, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14444, "lat": 55.827383, "lon": 37.493611, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14602, "lat": 55.853521, "lon": 37.444749, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14628, "lat": 55.87118, "lon": 37.457931, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14788, "lat": 55.866056, "lon": 37.533037, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14789, "lat": 55.864027, "lon": 37.538309, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14790, "lat": 55.868449, "lon": 37.527594, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14791, "lat": 55.865715, "lon": 37.528262, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14968, "lat": 55.871329, "lon": 37.494993, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 14997, "lat": 55.868235, "lon": 37.497461, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15117, "lat": 55.865236, "lon": 37.539739, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15120, "lat": 55.872842, "lon": 37.509762, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15135, "lat": 55.87849, "lon": 37.499501, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15716, "lat": 55.815779, "lon": 37.469243, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15722, "lat": 55.867599, "lon": 37.440517, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 15731, "lat": 55.882939, "lon": 37.516806, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 16389, "lat": 55.854491, "lon": 37.492647, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 16752, "lat": 55.841173, "lon": 37.442865, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 16824, "lat": 55.856369, "lon": 37.477996, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 16870, "lat": 55.883581, "lon": 37.471934, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 16967, "lat": 55.869198, "lon": 37.48479, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17385, "lat": 55.882743, "lon": 37.502109, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17413, "lat": 55.867155, "lon": 37.487157, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17419, "lat": 55.883665, "lon": 37.465659, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17422, "lat": 55.84454, "lon": 37.495335, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17472, "lat": 55.880952, "lon": 37.441503, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 17807, "lat": 55.86227, "lon": 37.487897, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19100, "lat": 55.877783, "lon": 37.469223, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19157, "lat": 55.849329, "lon": 37.440196, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19693, "lat": 55.882892, "lon": 37.450654, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19811, "lat": 55.885385, "lon": 37.444348, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19846, "lat": 55.833242, "lon": 37.508536, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19948, "lat": 55.877865, "lon": 37.482118, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 19990, "lat": 55.862798, "lon": 37.541368, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20133, "lat": 55.856974, "lon": 37.512819, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20155, "lat": 55.842573, "lon": 37.477827, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20210, "lat": 55.863746, "lon": 37.53192, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20225, "lat": 55.873381, "lon": 37.463701, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20315, "lat": 55.851369, "lon": 37.484091, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20367, "lat": 55.85895, "lon": 37.50619, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20429, "lat": 55.853653, "lon": 37.439502, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20472, "lat": 55.847295, "lon": 37.457135, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20590, "lat": 55.846475, "lon": 37.475595, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20699, "lat": 55.872545, "lon": 37.485415, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 20762, "lat": 55.8637, "lon": 37.517604, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 21034, "lat": 55.839644, "lon": 37.489101, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 21355, "lat": 55.843389, "lon": 37.493557, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 21516, "lat": 55.850495, "lon": 37.451745, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 21517, "lat": 55.880133, "lon": 37.464989, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 21556, "lat": 55.872854, "lon": 37.511022, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 35793, "lat": 55.837281, "lon": 37.479249, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 35887, "lat": 55.850679, "lon": 37.445187, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 36096, "lat": 55.856244, "lon": 37.49264, "operator": "MTS", "radius": 1500.0}, {"generation": "4g", "id": 775404, "lat": 55.882455, "lon": 37.457812, "operator": "MTS", "radius": 1500.0}]');
+            const twoGisApiKey = JSON.parse('"acc5d024-f7d0-40de-a3d9-b82e41b0df09"');
+            const initialCenterLat = JSON.parse('55.7558');
+            const initialCenterLon = JSON.parse('37.6173');
+            const initialZoom = JSON.parse('12');
+            
+            if (typeof mapgl === 'undefined' || !twoGisApiKey) { 
+                alert("Map initialization error."); 
+                return; 
+            }
+            
+            const map = new mapgl.Map('map', { 
+                center: [initialCenterLon, initialCenterLat], 
+                zoom: initialZoom, 
+                key: twoGisApiKey 
+            });
+            
+            const operatorColors = {
+                'MTS': '#e60000', 'Beeline': '#ffdd00', 
+                'Megafon': '#00b550', 'Tele2': '#1f1f1f', 'default': '#808080'
+            };
+            
+            let droneLocation = null, endPoint = null, droneMarker = null, endMarker = null, routeLine = null;
+            let stationMarkers = [], stationCircles = [], stationsVisible = true;
+            let intersectionMarkers = [], warningCircles = [], currentRouteWaypoints = [];
+            let socket = null;
+            
+            // DOM elements
+            const resetButton = document.getElementById('resetButton');
+            const startDemoButton = document.getElementById('startDemoButton');
+            const toggleStationsButton = document.getElementById('toggleStationsButton');
+            const pointA_coords = document.getElementById('pointA_coords');
+            const pointB_coords = document.getElementById('pointB_coords');
+            const route_length_span = document.getElementById('route_length');
+            const maneuvers_list = document.getElementById('maneuvers_list');
+            const intersection_count_span = document.getElementById('intersection_count');
+            const intersection_points_list = document.getElementById('intersection_points_list');
+            const server_status_span = document.getElementById('server_status');
+            const stations_list_elem = document.getElementById('stations_list');
+            const signal_bar = document.getElementById('signal_bar');
+            const active_stations = document.getElementById('active_stations');
+            
+            // Utility functions
+            function toRadians(d) { return d * Math.PI / 180; }
+            
+            function calculateDistanceMeters(lat1, lon1, lat2, lon2) { 
+                const R = 6371000;
+                const dLat = toRadians(lat2 - lat1);
+                const dLon = toRadians(lon2 - lon1);
+                const a = Math.sin(dLat / 2)**2 + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2)**2;
+                return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            }
+            
+            function isPointInCircle(pLat, pLon, cLat, cLon, cRad) { 
+                return calculateDistanceMeters(pLat, pLon, cLat, cLon) <= cRad; 
+            }
+            
+            const STATION_VISIBILITY_RADIUS = 150; // meters
+            
+            function renderStationsNearDrone() { 
+                stationMarkers.forEach(m => m.destroy()); 
+                stationCircles.forEach(c => c.destroy()); 
+                stationMarkers = []; 
+                stationCircles = []; 
+                stations_list_elem.innerHTML = ''; 
+                
+                const nearbyStations = droneLocation 
+                    ? stationsData.filter(s => calculateDistanceMeters(droneLocation.lat, droneLocation.lon, s.lat, s.lon) <= STATION_VISIBILITY_RADIUS)
+                    : [];
+                
+                nearbyStations.forEach(s => { 
+                    const color = operatorColors[s.operator] || operatorColors['default']; 
+                    stationMarkers.push(new mapgl.Marker(map, { 
+                        coordinates: [s.lon, s.lat], 
+                        label: { text: `📡 ${s.id} (${s.operator})`, color: color, fontSize: 12, stroke: 'white' } 
+                    })); 
+                    stationCircles.push(new mapgl.Circle(map, { 
+                        coordinates: [s.lon, s.lat], 
+                        radius: s.radius, 
+                        color: 'rgba(100, 150, 255, 0.1)', 
+                        stroke: color, 
+                        strokeWidth: 2,
+                        interactive: false 
+                    })); 
+                    const li = document.createElement('li'); 
+                    li.innerHTML = `<span style="color: ${color}; font-weight: bold;">●</span> ID ${s.id} (${s.operator}) - ${s.radius}m`; 
+                    stations_list_elem.appendChild(li); 
+                }); 
+                toggleStationsButton.textContent = 'Hide Stations'; 
+            }
+            
+            function renderRouteLine(coords) { 
+                if (routeLine) routeLine.destroy(); 
+                routeLine = new mapgl.Polyline(map, { 
+                    coordinates: coords, 
+                    width: 5, 
+                    color: '#00aaff',
+                    dashArray: [10, 5]
+                }); 
+            }
+            
+            function renderManeuvers(maneuvers) { 
+                maneuvers_list.innerHTML = maneuvers?.length 
+                    ? maneuvers.map(m => `<li>➤ ${m.comment}</li>`).join('') 
+                    : '<li>No route</li>'; 
+            }
+            
+            function analyzeRouteForIntersections(routePoints, stations) { 
+                const results = []; 
+                routePoints.forEach(p => { 
+                    const coveredBy = stations.filter(s => isPointInCircle(p.lat, p.lon, s.lat, s.lon, s.radius)).map(s => s.id); 
+                    if (coveredBy.length > 1) results.push({ ...p, covered_by: coveredBy }); 
+                }); 
+                return results; 
+            }
+            
+            function renderIntersectionPoints(points) { 
+                intersectionMarkers.forEach(m => m.destroy()); 
+                intersectionMarkers = points.map(p => new mapgl.Circle(map, { 
+                    coordinates: [p.lon, p.lat], 
+                    radius: 8, 
+                    color: 'rgba(0, 255, 100, 0.7)' 
+                })); 
+                intersection_count_span.textContent = points.length; 
+                intersection_points_list.innerHTML = points.length 
+                    ? points.map(p => `<li>(${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}) - Stations: [${p.covered_by.join(',')}]</li>`).join('') 
+                    : ''; 
+            }
+            
+            async function fetchRoute(start, finish) { 
+                try { 
+                    const res = await fetch(`https://routing.api.2gis.com/routing/7.0.0/global?key=${twoGisApiKey}`, { 
+                        method: "POST", 
+                        headers: { "Content-Type": "application/json" }, 
+                        body: JSON.stringify({ 
+                            points: [{ lon: start.lon, lat: start.lat }, { lon: finish.lon, lat: finish.lat }], 
+                            transport: "driving", 
+                            output: "detailed" 
+                        }) 
+                    }); 
+                    
+                    if (!res.ok) { 
+                        const err = await res.json().catch(() => null); 
+                        throw new Error(err?.error?.message || `HTTP ${res.status}`); 
+                    } 
+                    
+                    const parsed = await res.json(); 
+                    if (!parsed?.result?.[0]) throw new Error("API returned empty result."); 
+                    
+                    const routeData = parsed.result[0]; 
+                    const coords = routeData.maneuvers.flatMap(m => 
+                        m.outcoming_path?.geometry?.flatMap(g => 
+                            g.selection.replace(/LINESTRING\(|\)/g, "").split(',').map(pStr => { 
+                                const p = pStr.trim().split(" ").map(Number); 
+                                return (p.length === 2 && !isNaN(p[0])) ? { lon: p[0], lat: p[1] } : null; 
+                            }).filter(Boolean)
+                        ) || []
+                    ); 
+                    
+                    if (coords.length > 0) { 
+                        currentRouteWaypoints = coords;
+                        renderRouteLine(coords.map(c => [c.lon, c.lat])); 
+                        renderManeuvers(routeData.maneuvers); 
+                        route_length_span.textContent = `${(routeData.total_distance / 1000).toFixed(2)} km`; 
+                        renderIntersectionPoints(analyzeRouteForIntersections(coords, stationsData)); 
+                        
+                        // Send route to server for drone navigation
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            socket.send(JSON.stringify({
+                                type: 'set_route',
+                                payload: { waypoints: coords }
+                            }));
+                        }
+                    } 
+                } catch (err) { 
+                    console.error('Route error:', err);
+                    alert(`Route error: ${err.message}`); 
+                } 
+            }
+            
+            function updateDroneLocation(lat, lon, signalQuality, stationsUsed) { 
+                clearWarningCircles(); 
+                droneLocation = { lat, lon }; 
+                pointA_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
+                
+                // Update signal bar
+                signal_bar.style.width = `${signalQuality || 0}%`;
+                signal_bar.style.background = signalQuality > 60 
+                    ? 'linear-gradient(90deg, #00cc66, #66ff99)' 
+                    : signalQuality > 30 
+                        ? 'linear-gradient(90deg, #ffaa00, #ffcc00)'
+                        : 'linear-gradient(90deg, #ff4444, #ff6666)';
+                
+                // Update active stations
+                if (stationsUsed && stationsUsed.length > 0) {
+                    active_stations.textContent = stationsUsed.join(', ');
+                }
+                
+                if (!droneMarker) { 
+                    droneMarker = new mapgl.Marker(map, { 
+                        coordinates: [lon, lat], 
+                        icon: './icons/drone.png', 
+                        size: [48, 48] 
+                    }); 
+                } else { 
+                    droneMarker.setCoordinates([lon, lat]); 
+                } 
+                
+                // Smooth camera follow
+                map.setCenter([lon, lat], { duration: 300 });
+                
+                // Update visible stations near drone
+                if (stationsVisible) {
+                    renderStationsNearDrone();
+                }
+            }
+            
+            function clearWarningCircles() { 
+                warningCircles.forEach(c => c.destroy()); 
+                warningCircles = []; 
+            }
+            
+            // WebSocket connection
+            function connectWebSocket() {
+                socket = new WebSocket('ws://localhost:8765');
+                
+                socket.onopen = () => { 
+                    server_status_span.textContent = "Connected"; 
+                    server_status_span.className = "status-connected"; 
+                };
+                
+                socket.onmessage = (event) => { 
+                    const data = JSON.parse(event.data); 
+                    
+                    if (data.type === 'location_update') { 
+                        if (data.payload.lat && data.payload.lon) { 
+                            updateDroneLocation(
+                                data.payload.lat, 
+                                data.payload.lon,
+                                data.payload.signal_quality,
+                                data.payload.stations_used
+                            ); 
+                        } 
+                    } else if (data.type === 'warning_low_signal') { 
+                        clearWarningCircles(); 
+                        data.payload.forEach(t => warningCircles.push(new mapgl.Circle(map, { 
+                            coordinates: [t.lon, t.lat], 
+                            radius: t.radius, 
+                            color: 'rgba(255, 165, 0, 0.2)', 
+                            stroke: 'orange', 
+                            strokeWidth: 3 
+                        }))); 
+                    } 
+                };
+                
+                socket.onclose = () => { 
+                    server_status_span.textContent = "Disconnected"; 
+                    server_status_span.className = "status-disconnected";
+                    // Reconnect after 3 seconds
+                    setTimeout(connectWebSocket, 3000);
+                };
+                
+                socket.onerror = () => { 
+                    server_status_span.textContent = "Error"; 
+                    server_status_span.className = "status-disconnected"; 
+                };
+            }
+            
+            connectWebSocket();
+            
+            // Event handlers
+            map.on('click', (event) => { 
+                const [lon, lat] = event.lngLat; 
+                endPoint = { lon, lat }; 
+                
+                if (endMarker) endMarker.destroy(); 
+                endMarker = new mapgl.Marker(map, { 
+                    coordinates: [lon, lat], 
+                    icon: './icons/finish.svg', 
+                    size: [36, 36], 
+                    anchor: [18, 36], 
+                    label: { text: '🎯 Destination', color: '#ff4444', fontSize: 12 } 
+                }); 
+                
+                pointB_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
+                
+                if (droneLocation && calculateDistanceMeters(droneLocation.lat, droneLocation.lon, endPoint.lat, endPoint.lon) > 10) { 
+                    fetchRoute(droneLocation, endPoint); 
+                } 
+            });
+            
+            startDemoButton.addEventListener('click', () => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'start_demo' }));
+                }
+            });
+            
+            resetButton.addEventListener('click', () => { 
+                droneLocation = null; 
+                endPoint = null; 
+                currentRouteWaypoints = [];
+                
+                if (droneMarker) droneMarker.destroy(); 
+                if (endMarker) endMarker.destroy(); 
+                if (routeLine) routeLine.destroy(); 
+                intersectionMarkers.forEach(m => m.destroy()); 
+                clearWarningCircles(); 
+                
+                droneMarker = endMarker = routeLine = null; 
+                intersectionMarkers = []; 
+                
+                pointA_coords.textContent = 'Waiting...'; 
+                pointB_coords.textContent = 'Not set'; 
+                route_length_span.textContent = '0 m'; 
+                maneuvers_list.innerHTML = '<li>No route</li>'; 
+                intersection_count_span.textContent = '0'; 
+                intersection_points_list.innerHTML = ''; 
+                signal_bar.style.width = '0%';
+                active_stations.textContent = '-';
+                
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'stop' }));
+                }
+            });
+            
+            toggleStationsButton.addEventListener('click', () => { 
+                stationsVisible = !stationsVisible; 
+                if (stationsVisible) {
+                    renderStationsNearDrone();
+                } else {
+                    stationMarkers.forEach(m => m.destroy());
+                    stationCircles.forEach(c => c.destroy());
+                    stationMarkers = [];
+                    stationCircles = [];
+                }
+                toggleStationsButton.textContent = stationsVisible ? 'Hide Stations' : 'Show Stations'; 
+            });
+            
+            // Initial render (empty until drone position is known)
+            renderStationsNearDrone();
+        });
+    </script>
+</body>
+</html>
