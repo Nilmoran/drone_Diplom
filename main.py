@@ -21,6 +21,16 @@ except ImportError:
     subprocess.check_call(['pip', 'install', 'websockets'])
     import websockets
 
+try:
+    import numpy as np
+    from scipy.optimize import minimize
+except ImportError:
+    print("Installing numpy and scipy for advanced trilateration...")
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'numpy', 'scipy'])
+    import numpy as np
+    from scipy.optimize import minimize
+
 # --- Constants ---
 DB_NAME_STATIONS = 'stations.db'
 TABLE_NAME_STATIONS = 'stations'
@@ -64,6 +74,24 @@ LOOKAHEAD_DISTANCE_M = 50.0     # Look-ahead distance for turn anticipation (met
 CURVATURE_SMOOTHING = 0.3       # Curvature smoothing factor (0-1, higher = smoother)
 VELOCITY_SMOOTHING_ALPHA = 0.6  # Velocity smoothing factor (exponential moving average) - reduced for faster response
 
+# Predefined drone starting locations in Moscow
+MOSCOW_DRONE_LOCATIONS = [
+    {'id': 'rechnoy_vokzal', 'name': 'Rechnoy Vokzal', 'lat': 55.8519, 'lon': 37.4721, 'description': 'SAO - Rechnoy Vokzal'},
+    {'id': 'kremlin', 'name': 'Kremlin', 'lat': 55.7520, 'lon': 37.6156, 'description': 'Moscow Kremlin'},
+    {'id': 'sparrow_hills', 'name': 'Sparrow Hills', 'lat': 55.7108, 'lon': 37.5532, 'description': 'Sparrow Hills observation point'},
+    {'id': 'vdnh', 'name': 'VDNKh', 'lat': 55.8304, 'lon': 37.6214, 'description': 'VDNKh Exhibition Center'},
+    {'id': 'kutuzovsky', 'name': 'Kutuzovsky Prospect', 'lat': 55.7444, 'lon': 37.5364, 'description': 'Kutuzovsky Prospect area'},
+    {'id': 'tverskaya', 'name': 'Tverskaya Street', 'lat': 55.7558, 'lon': 37.6056, 'description': 'Tverskaya Street - main street'},
+    {'id': 'gorky_park', 'name': 'Gorky Park', 'lat': 55.7320, 'lon': 37.6014, 'description': 'Gorky Central Park of Culture'},
+    {'id': 'ostankino', 'name': 'Ostankino Tower', 'lat': 55.8197, 'lon': 37.6117, 'description': 'Ostankino TV Tower area'},
+    {'id': 'luzhniki', 'name': 'Luzhniki Stadium', 'lat': 55.7158, 'lon': 37.5536, 'description': 'Luzhniki Olympic Complex'},
+    {'id': 'sheremetyevo', 'name': 'Sheremetyevo Airport', 'lat': 55.9736, 'lon': 37.4145, 'description': 'Sheremetyevo International Airport'},
+    {'id': 'domodedovo', 'name': 'Domodedovo Airport', 'lat': 55.4143, 'lon': 37.9005, 'description': 'Domodedovo Airport area'},
+    {'id': 'izmailovo', 'name': 'Izmailovo Park', 'lat': 55.7879, 'lon': 37.7704, 'description': 'Izmailovo Park and Market'},
+    {'id': 'kolomenskoye', 'name': 'Kolomenskoye', 'lat': 55.6670, 'lon': 37.6680, 'description': 'Kolomenskoye Museum-Reserve'},
+    {'id': 'tsaritsyno', 'name': 'Tsaritsyno Park', 'lat': 55.6200, 'lon': 37.6820, 'description': 'Tsaritsyno Museum-Reserve'},
+]
+
 # Global state
 connected_clients = set()
 drone_state = {
@@ -77,7 +105,8 @@ drone_state = {
     'consecutive_failures': 0,  # Track measurement failures
     'segment_progress': {},  # Track progress along each route segment
     'route_deviation': 0.0,  # Current deviation from route in meters
-    'correction_active': False  # Whether correction is being applied
+    'correction_active': False,  # Whether correction is being applied
+    'selected_start_location': None  # Selected starting location from predefined list
 }
 
 # --- Kalman Filter for Position Smoothing ---
@@ -347,7 +376,8 @@ def generate_map_html(stations_data, api_key, output_file=MAP_HTML_FILE):
         two_gis_api_key=api_key,
         initial_center_lat=55.7558,
         initial_center_lon=37.6173,
-        initial_zoom=12
+        initial_zoom=12,
+        drone_locations=MOSCOW_DRONE_LOCATIONS
     )
     output_path = os.path.join(BASE_DIR, output_file)
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -355,6 +385,130 @@ def generate_map_html(stations_data, api_key, output_file=MAP_HTML_FILE):
     print(f"\nMap generated: {os.path.abspath(output_path)}")
 
 # --- Radio Navigation (Trilateration) ---
+
+# Station Selection Parameters
+MAX_TOWERS_TO_SELECT = 7  # Maximum number of towers to select for calculation
+METERS_IN_DEGREE = 111000.0  # Approximate meters in one degree of latitude
+
+def calculate_distance(point_1, point_2):
+    """Calculate Euclidean distance between points (in degrees)."""
+    return np.sqrt((point_1[0] - point_2[0])**2 + (point_1[1] - point_2[1])**2)
+
+def select_diverse_towers(towers, num_to_select):
+    """
+    Select N most diverse (spread out) towers from the list.
+    
+    Uses a greedy algorithm to maximize minimum distance between selected towers.
+    This ensures better geometric diversity for trilateration accuracy.
+    
+    Args:
+        towers: List of tower tuples (id, lon, lat, radius, generation, operator, signal)
+        num_to_select: Maximum number of towers to select
+        
+    Returns:
+        List of selected tower tuples
+    """
+    if not towers or len(towers) <= num_to_select:
+        return towers
+    
+    selected_towers = [towers[0]]
+    remaining_towers = towers[1:]
+    
+    while len(selected_towers) < num_to_select and remaining_towers:
+        best_candidate, max_min_dist = None, -1
+        
+        for candidate in remaining_towers:
+            candidate_coords = (candidate[1], candidate[2])  # (lon, lat)
+            min_dist_to_selected = min([
+                calculate_distance(candidate_coords, (s[1], s[2])) 
+                for s in selected_towers
+            ])
+            
+            if min_dist_to_selected > max_min_dist:
+                max_min_dist, best_candidate = min_dist_to_selected, candidate
+        
+        if best_candidate:
+            selected_towers.append(best_candidate)
+            remaining_towers.remove(best_candidate)
+    
+    return selected_towers
+
+def find_weighted_intersection_center(towers_with_signals):
+    """
+    Find a point within the intersection area, weighted toward towers with stronger signals.
+    
+    Uses constrained optimization to find the optimal position that:
+    1. Minimizes weighted sum of squared distances (weighted by signal strength)
+    2. Ensures the point is within all tower coverage radii
+    
+    Args:
+        towers_with_signals: List of tuples (id, lon, lat, radius_meters, generation, operator, signal_strength)
+        
+    Returns:
+        Dictionary with 'point' (lon, lat) tuple and 'success' boolean
+    """
+    if not towers_with_signals:
+        return {'point': None, 'success': False}
+    
+    # Convert all data to comparable units (degrees)
+    towers_in_degrees = []
+    for id, lon, lat, r_meters, g, o, signal in towers_with_signals:
+        r_degrees = r_meters / METERS_IN_DEGREE
+        towers_in_degrees.append((id, lon, lat, r_degrees, g, o, signal))
+    
+    # Objective function: minimize weighted sum of squared distances (in degrees)
+    # Higher signal strength = higher weight = point moves closer to that tower
+    def objective(point):
+        return np.sum([
+            signal * ((point[0] - lon)**2 + (point[1] - lat)**2) 
+            for id, lon, lat, r_deg, g, o, signal in towers_in_degrees
+        ])
+    
+    # Constraints: point must be within radius of each tower (in degrees)
+    # FIXED: Lambda closure bug - use default arguments to capture values correctly
+    constraints = []
+    for id, lon, lat, r_deg, g, o, signal in towers_in_degrees:
+        constraints.append({
+            'type': 'ineq', 
+            'fun': lambda p, r=r_deg, lon_val=lon, lat_val=lat: r**2 - ((p[0]-lon_val)**2 + (p[1]-lat_val)**2)
+        })
+    
+    # Initial guess: mean of all tower positions
+    initial_guess = np.mean(np.array([(c[1], c[2]) for c in towers_in_degrees]), axis=0)
+    
+    try:
+        # FIXED: Use more lenient tolerance and options to reduce optimization failures
+        result = minimize(
+            objective, 
+            initial_guess, 
+            method='SLSQP', 
+            constraints=constraints, 
+            tol=1e-6,  # Reduced from 1e-9 for better convergence
+            options={'maxiter': 100, 'ftol': 1e-6}  # Limit iterations and tolerance
+        )
+        
+        if result.success:
+            final_point = result.x
+            
+            # Additional validation: check constraints with small tolerance
+            for const in constraints:
+                if const['fun'](final_point) < -1e-6:
+                    print(f"Warning: Optimizer reported success but point violates constraints. Using centroid fallback.")
+                    # Fallback to simple centroid
+                    centers = np.array([(c[1], c[2]) for c in towers_in_degrees])
+                    return {'point': tuple(np.mean(centers, axis=0)), 'success': True}
+            
+            return {'point': tuple(final_point), 'success': True}
+        else:
+            print(f"Optimization failed: {result.message}. Using centroid fallback.")
+            # Fallback to simple centroid
+            centers = np.array([(c[1], c[2]) for c in towers_in_degrees])
+            return {'point': tuple(np.mean(centers, axis=0)), 'success': True}
+    except Exception as e:
+        print(f"Optimization error: {e}. Using centroid fallback.")
+        # Fallback to simple centroid
+        centers = np.array([(c[1], c[2]) for c in towers_in_degrees])
+        return {'point': tuple(np.mean(centers, axis=0)), 'success': True}
 
 def calculate_distance_meters(lat1, lon1, lat2, lon2):
     """Haversine formula for distance calculation"""
@@ -375,8 +529,13 @@ def simulate_lte_signal_strength(distance, station_radius):
     return signal_strength
 
 def measure_ranges_from_stations(true_lat, true_lon, stations):
-    """Simulate range measurements from cellular base stations with improved LTE accuracy"""
+    """
+    Simulate range measurements from cellular base stations with improved LTE accuracy.
+    Returns measurements with signal strength for station selection.
+    """
     measurements = []
+    towers_with_signals = []  # For station selection: (id, lon, lat, radius, generation, operator, signal)
+    
     for station in stations:
         true_distance = calculate_distance_meters(true_lat, true_lon, station['lat'], station['lon'])
         if true_distance <= station['radius'] * 1.2:  # Station in range
@@ -401,6 +560,17 @@ def measure_ranges_from_stations(true_lat, true_lon, stations):
                 # Add measurement uncertainty estimate for weighting
                 measurement_uncertainty = noise_std
                 
+                # Store for station selection (with signal strength)
+                towers_with_signals.append((
+                    station['id'],
+                    station['lon'],
+                    station['lat'],
+                    station['radius'],
+                    station.get('generation', '4g'),
+                    station.get('operator', 'Unknown'),
+                    signal_strength
+                ))
+                
                 measurements.append({
                     'station_id': station['id'],
                     'lat': station['lat'],
@@ -409,60 +579,65 @@ def measure_ranges_from_stations(true_lat, true_lon, stations):
                     'signal_strength': signal_strength,
                     'uncertainty': measurement_uncertainty  # For better weighting
                 })
-    return measurements
+    
+    # Select diverse towers for better trilateration accuracy
+    selected_towers = select_diverse_towers(towers_with_signals, MAX_TOWERS_TO_SELECT)
+    selected_station_ids = {t[0] for t in selected_towers}  # Set of selected station IDs
+    
+    # Filter measurements to only include selected stations
+    filtered_measurements = [m for m in measurements if m['station_id'] in selected_station_ids]
+    
+    # Store selected towers info for map display
+    return {
+        'measurements': filtered_measurements,
+        'selected_stations': selected_towers,  # (id, lon, lat, radius, generation, operator, signal)
+        'all_measurements': measurements  # Keep for reference
+    }
 
-def trilaterate_position(measurements):
-    """Calculate UAV position using improved weighted least squares trilateration"""
+def trilaterate_position(measurement_data):
+    """
+    Calculate UAV position using weighted intersection center optimization.
+    
+    Uses the selected diverse stations to find the optimal position within
+    the intersection of all tower coverage areas, weighted by signal strength.
+    
+    Args:
+        measurement_data: Dictionary with 'measurements' and 'selected_stations'
+        
+    Returns:
+        Dictionary with 'lat' and 'lon', or None if insufficient data
+    """
+    if isinstance(measurement_data, dict):
+        measurements = measurement_data.get('measurements', [])
+        selected_stations = measurement_data.get('selected_stations', [])
+    else:
+        # Backward compatibility: if old format (list), convert
+        measurements = measurement_data
+        selected_stations = []
+    
     if len(measurements) < 3:
         return None
     
-    # Sort by signal strength and use best stations (use more if available for better accuracy)
-    measurements = sorted(measurements, key=lambda x: -x['signal_strength'])[:min(6, len(measurements))]
+    # If we have selected stations with signals, use weighted intersection method
+    if selected_stations and len(selected_stations) >= 3:
+        result = find_weighted_intersection_center(selected_stations)
+        if result['success'] and result['point']:
+            lon, lat = result['point']
+            return {'lat': lat, 'lon': lon}
     
-    # Outlier detection: remove measurements that are inconsistent with others
-    if len(measurements) >= 4:
-        # Calculate pairwise distances between stations
-        station_distances = []
-        for i, m1 in enumerate(measurements):
-            for m2 in measurements[i+1:]:
-                dist = calculate_distance_meters(m1['lat'], m1['lon'], m2['lat'], m2['lon'])
-                station_distances.append(dist)
-        
-        # Remove measurements that would require impossible geometry
-        filtered_measurements = []
-        for m in measurements:
-            # Check if this measurement is consistent with at least 2 others
-            consistent_count = 0
-            for other in measurements:
-                if m == other:
-                    continue
-                # If two stations are close, their distance measurements should be similar
-                station_dist = calculate_distance_meters(m['lat'], m['lon'], other['lat'], other['lon'])
-                # Check if the difference in measured distances is reasonable
-                if abs(m['distance'] - other['distance']) <= station_dist + 100:  # Allow 100m margin
-                    consistent_count += 1
-            if consistent_count >= 2:
-                filtered_measurements.append(m)
-        
-        if len(filtered_measurements) >= 3:
-            measurements = filtered_measurements
+    # Fallback to original method if optimization fails or no selected stations
+    # This ensures backward compatibility
+    if len(measurements) < 3:
+        return None
     
-    # Calculate weights based on signal strength and measurement uncertainty
-    # Higher signal = better measurement, lower uncertainty = more reliable
+    # Original weighted least squares method as fallback
     weights = []
     for m in measurements:
-        # Signal strength weight (0-100)
         signal_weight = m['signal_strength'] / 100.0
-        
-        # Measurement uncertainty weight (use uncertainty if available, otherwise estimate)
         if 'uncertainty' in m and m['uncertainty'] > 0:
-            # Weight inversely proportional to uncertainty squared (like in least squares)
             uncertainty_weight = 1.0 / (1.0 + (m['uncertainty'] / 10.0) ** 2)
         else:
-            # Fallback: estimate uncertainty from distance
             uncertainty_weight = 1.0 / (1.0 + m['distance'] / 1000.0)
-        
-        # Combined weight: prioritize high signal and low uncertainty
         weight = signal_weight * uncertainty_weight
         weights.append(weight)
     
@@ -470,63 +645,11 @@ def trilaterate_position(measurements):
     if total_weight < 0.01:
         return None
     
-    # Normalize weights
     weights = [w / total_weight for w in weights]
-    
-    # Initial estimate: weighted centroid
     est_lat = sum(m['lat'] * w for m, w in zip(measurements, weights))
     est_lon = sum(m['lon'] * w for m, w in zip(measurements, weights))
     
-    # Improved iterative refinement with adaptive learning rate
-    best_error = float('inf')
-    best_estimate = (est_lat, est_lon)
-    learning_rate = 0.00005  # Start with higher learning rate
-    
-    for iteration in range(100):  # More iterations for better convergence
-        total_error = 0.0
-        grad_lat, grad_lon = 0.0, 0.0
-        
-        for m, weight in zip(measurements, weights):
-            calc_dist = calculate_distance_meters(est_lat, est_lon, m['lat'], m['lon'])
-            error = calc_dist - m['distance']
-            total_error += abs(error) * weight
-            
-            # More accurate gradient calculation
-            if calc_dist > 1.0:  # Avoid division by very small numbers
-                # Convert meters to degrees (more accurate)
-                meters_per_deg_lat = 111000.0
-                meters_per_deg_lon = 111000.0 * math.cos(math.radians(est_lat))
-                
-                # Unit vector from station to estimated position
-                delta_lat = est_lat - m['lat']
-                delta_lon = est_lon - m['lon']
-                
-                # Gradient components
-                grad_lat += weight * error * delta_lat / calc_dist / meters_per_deg_lat
-                grad_lon += weight * error * delta_lon / calc_dist / meters_per_deg_lon
-        
-        # Adaptive learning rate: reduce if error is decreasing
-        if total_error < best_error:
-            best_error = total_error
-            best_estimate = (est_lat, est_lon)
-            # Keep learning rate or slightly increase
-        else:
-            # Error increased, reduce learning rate
-            learning_rate *= 0.9
-        
-        # Update estimate
-        est_lat -= learning_rate * grad_lat
-        est_lon -= learning_rate * grad_lon
-        
-        # Early convergence check
-        if total_error < 5.0:  # Less than 5 meters error
-            break
-        
-        # Minimum learning rate to ensure convergence
-        learning_rate = max(learning_rate, 0.000001)
-    
-    # Use best estimate found during iterations
-    return {'lat': best_estimate[0], 'lon': best_estimate[1]}
+    return {'lat': est_lat, 'lon': est_lon}
 
 # --- Automatic Flight Control System ---
 #
@@ -559,12 +682,12 @@ class FlightControlSystem:
     
     def __init__(self):
         # PID controller for lateral path following (cross-track error)
-        # Optimized gains: higher ki for steady-state, lower kd to reduce overshoot
-        self.lateral_pid = PIDController(kp=0.8, ki=0.02, kd=0.2, max_output=MAX_BANK_ANGLE_DEG)
+        # Enhanced gains for improved trajectory accuracy: higher kp for faster response, tuned ki/kd
+        self.lateral_pid = PIDController(kp=1.0, ki=0.03, kd=0.25, max_output=MAX_BANK_ANGLE_DEG)  # Increased kp from 0.8 to 1.0
         
         # PID controller for longitudinal path following (along-track error)
-        # Optimized gains for better speed control
-        self.longitudinal_pid = PIDController(kp=0.4, ki=0.01, kd=0.12, max_output=MAX_ACCELERATION_MPS2)
+        # Enhanced gains for better speed control and position accuracy
+        self.longitudinal_pid = PIDController(kp=0.5, ki=0.015, kd=0.15, max_output=MAX_ACCELERATION_MPS2)  # Increased kp from 0.4 to 0.5
         
         # Rate limiter for bank angle changes (prevents sudden movements)
         self.bank_rate_limiter = RateLimiter(max_rate=MAX_BANK_RATE_DEG_S)
@@ -670,10 +793,16 @@ class FlightControlSystem:
         
         return desired_bank_deg
     
-    def update_adaptive_parameters(self, signal_quality, wind_conditions=None):
+    def update_adaptive_parameters(self, signal_quality, wind_conditions=None, stations_available=None):
         """Adapt control parameters based on environmental conditions"""
-        # Reduce control sensitivity in poor signal conditions
-        if signal_quality < 50:
+        # CRITICAL: Reduce control sensitivity in poor signal conditions or low station count
+        # This prevents erratic corrections when position is inaccurate
+        if stations_available is not None and stations_available < 3:
+            # Low station count: significantly reduce sensitivity to prevent erratic movement
+            self.adaptive_gain_factor = 0.4  # Very conservative - prevents erratic corrections
+        elif signal_quality < 30:
+            self.adaptive_gain_factor = 0.5  # Very poor signal
+        elif signal_quality < 50:
             self.adaptive_gain_factor = 0.7  # More conservative
         elif signal_quality < 75:
             self.adaptive_gain_factor = 0.85
@@ -686,17 +815,18 @@ class FlightControlSystem:
             pass
     
     def compute_control(self, current_pos, route_start, route_end, route_progress, 
-                       signal_quality, dt=None):
+                       signal_quality, dt=None, stations_available=None):
         """Compute control commands for path following
         
         Args:
             dt: Time step in seconds. If None, uses SIMULATION_UPDATE_INTERVAL_S
+            stations_available: Number of base stations available for trilateration
         """
         if dt is None:
             dt = SIMULATION_UPDATE_INTERVAL_S
-        """Compute control commands for path following"""
-        # Update adaptive parameters
-        self.update_adaptive_parameters(signal_quality)
+        
+        # Update adaptive parameters (pass station count for degraded mode detection)
+        self.update_adaptive_parameters(signal_quality, stations_available=stations_available)
         
         # Calculate path errors
         errors = self.calculate_path_error(current_pos, route_start, route_end, route_progress)
@@ -1150,13 +1280,17 @@ async def simulate_drone_flight(stations):
                         
                         # Compute flight control commands
                         # Use simulation update interval for consistent timing
+                        # CRITICAL: Pass station count to control system for adaptive behavior
+                        # Get station count from drone state (will be updated after measurements)
+                        stations_available = drone_state.get('last_station_count', 3)
                         control_output = fcs.compute_control(
                             control_position,
                             start,
                             end,
                             segment_progress,
                             drone_state.get('signal_quality', 100),
-                            dt=SIMULATION_UPDATE_INTERVAL_S
+                            dt=SIMULATION_UPDATE_INTERVAL_S,
+                            stations_available=stations_available
                         )
                         
                         # Use controlled speed (may be adjusted by control system)
@@ -1239,19 +1373,65 @@ async def simulate_drone_flight(stations):
                                         desired_prep_bank = turn_direction * MAX_BANK_ANGLE_DEG * prep_factor
                                         fcs.current_bank_angle = fcs.bank_rate_limiter.limit(desired_prep_bank, fcs.current_bank_angle, SIMULATION_UPDATE_INTERVAL_S)
                         
-                        # Calculate progress increment as fraction of total segment
-                        # Cap increment to prevent overshooting waypoints
+                        # ENHANCED: Calculate progress increment with improved precision
+                        # Cap increment to prevent overshooting waypoints while maintaining accuracy
                         progress_increment = move_distance / segment_distance
-                        max_increment = 0.1  # Maximum 10% progress per update (prevents skipping waypoints)
+                        max_increment = 0.15  # Increased from 0.1 to 15% for smoother progress (still safe)
                         progress_increment = min(progress_increment, max_increment)
                         
-                        # Update segment progress
+                        # Update segment progress with precision
                         segment_progress = min(1.0, segment_progress + progress_increment)
                         drone_state['segment_progress'][idx] = segment_progress
                         
                         # Calculate new position along route segment with smooth interpolation
-                        # The interpolate_position function now uses easing for natural motion
+                        # The interpolate_position function uses easing for natural motion
                         new_position = interpolate_position(start, end, segment_progress)
+                        
+                        # ENHANCED: Verify position accuracy - ensure we're exactly on the route
+                        # FIXED: Only project if deviation is extreme, and preserve forward progress
+                        # Calculate distance from calculated position to route line
+                        route_deviation = calculate_distance_to_route_segment(new_position, start, end)
+                        if route_deviation > 10.0:  # Increased threshold from 0.5m to 10.0m to prevent constant projection
+                            # Project position back onto route
+                            route_dx = end['lon'] - start['lon']
+                            route_dy = end['lat'] - start['lat']
+                            route_length = math.sqrt(route_dx**2 + route_dy**2)
+                            if route_length > 1e-10:
+                                pos_dx = new_position['lon'] - start['lon']
+                                pos_dy = new_position['lat'] - start['lat']
+                                # Project onto route
+                                t = (pos_dx * route_dx + pos_dy * route_dy) / (route_length * route_length)
+                                t = max(0.0, min(1.0, t))  # Clamp to [0, 1]
+                                
+                                # CRITICAL FIX: Only update progress if projected position is ahead
+                                # This prevents regression that causes deadlock
+                                if t > segment_progress - 0.01:  # Allow small backward correction but prevent major regression
+                                    # Recalculate position exactly on route
+                                    new_position = {
+                                        'lat': start['lat'] + t * route_dy,
+                                        'lon': start['lon'] + t * route_dx
+                                    }
+                                    # Update progress to match corrected position (only if ahead or slightly behind)
+                                    segment_progress = max(segment_progress - 0.01, t)  # Prevent major regression
+                                    drone_state['segment_progress'][idx] = segment_progress
+                                # If projection would cause major regression, keep current progress and just correct position
+                                else:
+                                    # Only correct position, don't change progress
+                                    # Project current progress position onto route
+                                    current_progress_pos = interpolate_position(start, end, segment_progress)
+                                    route_dev = calculate_distance_to_route_segment(current_progress_pos, start, end)
+                                    if route_dev > 10.0:
+                                        # Minimal correction: move toward route but preserve progress
+                                        route_dir_x = route_dx / route_length
+                                        route_dir_y = route_dy / route_length
+                                        # Project current position onto route at current progress
+                                        proj_lat = start['lat'] + segment_progress * route_dy
+                                        proj_lon = start['lon'] + segment_progress * route_dx
+                                        # Blend: 90% route position, 10% current position (minimal correction)
+                                        new_position = {
+                                            'lat': proj_lat * 0.9 + new_position['lat'] * 0.1,
+                                            'lon': proj_lon * 0.9 + new_position['lon'] * 0.1
+                                        }
                         
                         # VELOCITY VECTOR SMOOTHING: Maintain smooth velocity vector
                         # This helps with continuous motion between waypoints
@@ -1269,18 +1449,22 @@ async def simulate_drone_flight(stations):
                             
                             drone_state['velocity_vector'] = {'lat': vel_lat, 'lon': vel_lon}
                         
-                        # IMPROVED: Apply control system corrections more intelligently
-                        # Apply correction based on error magnitude, not just turn state
+                        # ENHANCED: Improved trajectory following with precise waypoint tracking
+                        # Apply correction based on error magnitude and route geometry
                         # During turns, apply smaller corrections to avoid fighting control system
                         is_in_turn = abs(control_output['bank_angle']) > 5.0  # Significant bank angle indicates turn
                         cross_track_error = abs(control_output['cross_track_error'])
+                        along_track_error = abs(control_output['along_track_error'])
                         
-                        if cross_track_error > 1.0:  # Apply correction for any significant error
-                            # Reduce correction during turns to avoid conflicts
+                        # Enhanced correction logic for better trajectory accuracy
+                        if cross_track_error > 0.5:  # Apply correction for any significant error (reduced threshold from 1.0m)
+                            # Adaptive correction factor based on error magnitude and turn state
                             if is_in_turn:
-                                correction_factor = min(0.08, cross_track_error / 80.0)  # Smaller correction during turns
+                                # During turns: smaller correction to avoid overcorrection
+                                correction_factor = min(0.12, cross_track_error / 60.0)  # Increased from 0.08 for better response
                             else:
-                                correction_factor = min(0.2, cross_track_error / 40.0)  # Larger correction on straight segments
+                                # On straight segments: larger correction for precise following
+                                correction_factor = min(0.25, cross_track_error / 30.0)  # Increased from 0.2 for better accuracy
                             
                             # Calculate correction direction (perpendicular to route)
                             route_dx = end['lon'] - start['lon']
@@ -1290,10 +1474,39 @@ async def simulate_drone_flight(stations):
                                 # Perpendicular vector (rotate 90 degrees)
                                 perp_dx = -route_dy / route_length
                                 perp_dy = route_dx / route_length
-                                # Apply correction (pull toward route)
+                                # Apply correction (pull toward route) with improved precision
                                 correction_sign = -1.0 if control_output['cross_track_error'] > 0 else 1.0
-                                new_position['lat'] += perp_dy * correction_factor * correction_sign * (control_output['cross_track_error'] / 111000.0)
-                                new_position['lon'] += perp_dx * correction_factor * correction_sign * (control_output['cross_track_error'] / (111000.0 * math.cos(math.radians(new_position['lat']))))
+                                # Convert meters to degrees more accurately
+                                lat_correction = perp_dy * correction_factor * correction_sign * (control_output['cross_track_error'] / 111000.0)
+                                lon_correction = perp_dx * correction_factor * correction_sign * (control_output['cross_track_error'] / (111000.0 * math.cos(math.radians(new_position['lat']))))
+                                new_position['lat'] += lat_correction
+                                new_position['lon'] += lon_correction
+                        
+                        # Along-track correction: ensure we're at the right progress point
+                        # FIXED: Increased threshold and prevent progress regression to avoid deadlock
+                        if along_track_error > 20.0:  # Increased from 2.0m to 20.0m to prevent constant triggering
+                            # Adjust progress to match actual position, but never reduce progress
+                            route_dx = end['lon'] - start['lon']
+                            route_dy = end['lat'] - start['lat']
+                            route_length = math.sqrt(route_dx**2 + route_dy**2)
+                            if route_length > 1e-10:
+                                # Calculate actual progress based on position
+                                pos_dx = new_position['lon'] - start['lon']
+                                pos_dy = new_position['lat'] - start['lat']
+                                # Project position onto route vector
+                                actual_progress = (pos_dx * route_dx + pos_dy * route_dy) / (route_length * route_length)
+                                actual_progress = max(0.0, min(1.0, actual_progress))
+                                
+                                # CRITICAL FIX: Only adjust if actual_progress is ahead of current progress
+                                # This prevents the feedback loop that causes deadlock
+                                if actual_progress > segment_progress + 0.01:  # Only if significantly ahead
+                                    # Smoothly adjust segment progress toward actual progress
+                                    segment_progress = segment_progress * 0.8 + actual_progress * 0.2
+                                    segment_progress = max(0.0, min(1.0, segment_progress))
+                                    drone_state['segment_progress'][idx] = segment_progress
+                                    # Recalculate position with corrected progress
+                                    new_position = interpolate_position(start, end, segment_progress)
+                                # If behind, don't reduce progress - allow forward movement to continue
                         
                         # CRITICAL: Always use route-based position for true_position
                         # This ensures the drone follows the route exactly
@@ -1372,17 +1585,28 @@ async def simulate_drone_flight(stations):
                         drone_state['route_index'] += 1
                         continue
                     
-                    # Measure ranges from base stations
-                    measurements = measure_ranges_from_stations(
+                    # Measure ranges from base stations and select best diverse stations
+                    measurement_result = measure_ranges_from_stations(
                         drone_state['true_position']['lat'],
                         drone_state['true_position']['lon'],
                         stations
                     )
                     
-                    # Calculate position using trilateration
+                    # Extract measurements and selected stations
+                    measurements = measurement_result.get('measurements', [])
+                    selected_stations = measurement_result.get('selected_stations', [])
+                    
+                    # Store selected stations for map display
+                    drone_state['selected_stations'] = selected_stations
+                    
+                    # Calculate position using trilateration with selected stations
                     position_updated = False
-                    if measurements and len(measurements) >= 3:
-                        calculated_pos = trilaterate_position(measurements)
+                    
+                    # CRITICAL: Handle degraded mode when stations < 3
+                    # With 2 stations, trilateration is ambiguous but possible
+                    # With < 2 stations, must use route-constrained dead reckoning
+                    if stations_available >= 2:
+                        calculated_pos = trilaterate_position(measurement_result)
                         if calculated_pos:
                             # Initialize Kalman filter if needed
                             if drone_state['kalman_filter'] is None:
@@ -1400,7 +1624,7 @@ async def simulate_drone_flight(stations):
                             )
                             
                             measured_position = {'lat': filtered_lat, 'lon': filtered_lon}
-                            drone_state['signal_quality'] = sum(m['signal_strength'] for m in measurements) / len(measurements)
+                            drone_state['signal_quality'] = sum(m['signal_strength'] for m in measurements) / len(measurements) if measurements else 0
                             
                             # HYBRID NAVIGATION: Combine route following with trilateration correction
                             if drone_state.get('true_position') and idx < len(route) - 1:
@@ -1447,8 +1671,9 @@ async def simulate_drone_flight(stations):
                                 # Fallback: use measured position directly
                                 drone_state['position'] = measured_position
                             
-                            # Broadcast position to all connected clients
-                            await broadcast_position(measurements)
+                            # Broadcast position to all connected clients with selected station IDs
+                            selected_station_ids = [m['station_id'] for m in measurements]
+                            await broadcast_position(measurements, selected_station_ids)
                             position_updated = True
                             drone_state['consecutive_failures'] = 0
                         else:
@@ -1456,31 +1681,74 @@ async def simulate_drone_flight(stations):
                     else:
                         drone_state['consecutive_failures'] = drone_state.get('consecutive_failures', 0) + 1
                     
-                    # Fallback: Dead reckoning if measurements fail
+                    # Fallback: Enhanced dead reckoning with route constraint when measurements fail
                     if not position_updated:
-                        if drone_state['position'] and drone_state['kalman_filter']:
-                            # Use Kalman filter prediction (dead reckoning)
+                        # CRITICAL FIX: Use route-constrained navigation when stations insufficient
+                        # This prevents erratic movement by constraining position to route
+                        if drone_state.get('route') and drone_state.get('true_position') and idx < len(route) - 1:
+                            # Enhanced dead reckoning: blend route position with Kalman prediction
+                            route_pos = copy_waypoint(drone_state['true_position'])
+                            
+                            if drone_state['position'] and drone_state['kalman_filter']:
+                                # Use Kalman filter prediction (dead reckoning)
+                                kf = drone_state['kalman_filter']
+                                kf.predict()
+                                kf_pos = kf.get_position()
+                                
+                                # Blend: 85% route, 15% Kalman (trust route more in low coverage)
+                                # This prevents position from drifting away from route
+                                blended_pos = {
+                                    'lat': route_pos['lat'] * 0.85 + kf_pos['lat'] * 0.15,
+                                    'lon': route_pos['lon'] * 0.85 + kf_pos['lon'] * 0.15
+                                }
+                                
+                                # CRITICAL: Project onto route if deviation too large
+                                # This prevents erratic movement by keeping position on route
+                                route_start = copy_waypoint(route[idx])
+                                route_end = copy_waypoint(route[idx + 1])
+                                route_deviation = calculate_distance_to_route_segment(
+                                    blended_pos, route_start, route_end
+                                )
+                                
+                                if route_deviation > 30.0:  # If >30m off route, snap to route
+                                    # Use route position directly to prevent erratic movement
+                                    drone_state['position'] = route_pos
+                                    if loop_count % 20 == 0:
+                                        print(f"Low coverage (stations={stations_available}): Using route position (deviation was {route_deviation:.1f}m)")
+                                else:
+                                    # Use blended position (slightly off route but smooth)
+                                    drone_state['position'] = blended_pos
+                            else:
+                                # No Kalman filter: use route position directly
+                                drone_state['position'] = route_pos
+                            
+                            # Signal quality degrades slowly in low coverage
+                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 0.5)  # Slower degradation
+                            
+                            # Broadcast with reduced signal quality (no selected stations)
+                            await broadcast_position([], [])
+                        elif drone_state['position'] and drone_state['kalman_filter']:
+                            # Fallback: pure Kalman prediction (no route available)
                             kf = drone_state['kalman_filter']
                             kf.predict()
                             predicted_pos = kf.get_position()
                             drone_state['position'] = predicted_pos
-                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 5)
-                            
-                            # Broadcast with reduced signal quality
-                            await broadcast_position([])
+                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 1)
+                            await broadcast_position([], [])
                         elif drone_state['true_position']:
                             # Last resort: use true position (for simulation)
                             drone_state['position'] = copy_waypoint(drone_state['true_position'])
-                            # Always broadcast position, even without measurements
-                            await broadcast_position([])
+                            await broadcast_position([], [])
                         else:
                             # No position at all - this shouldn't happen, but log it
                             print(f"ERROR: No position data available at loop {loop_count}")
                         
-                        # Warn if too many consecutive failures
-                        if drone_state.get('consecutive_failures', 0) >= max_consecutive_failures:
-                            await broadcast_low_signal_warning(stations, drone_state['true_position'])
-                            print(f"Warning: {drone_state['consecutive_failures']} consecutive measurement failures")
+                        # FIXED: Only warn every 10 failures to reduce log spam, and increase threshold
+                        consecutive_failures = drone_state.get('consecutive_failures', 0)
+                        if consecutive_failures >= max_consecutive_failures:
+                            if consecutive_failures % 10 == 0:  # Only warn every 10 failures
+                                await broadcast_low_signal_warning(stations, drone_state.get('true_position') or drone_state.get('position'))
+                                print(f"Warning: {consecutive_failures} consecutive measurement failures")
                 else:
                     # At last waypoint, continue moving toward final destination
                     final_waypoint = copy_waypoint(route[-1])
@@ -1525,17 +1793,28 @@ async def simulate_drone_flight(stations):
                         print("UAV reached destination")
                         continue
                     
-                    # Measure ranges from base stations
-                    measurements = measure_ranges_from_stations(
+                    # Measure ranges from base stations and select best diverse stations
+                    measurement_result = measure_ranges_from_stations(
                         drone_state['true_position']['lat'],
                         drone_state['true_position']['lon'],
                         stations
                     )
                     
-                    # Calculate position using trilateration
+                    # Extract measurements and selected stations
+                    measurements = measurement_result.get('measurements', [])
+                    selected_stations = measurement_result.get('selected_stations', [])
+                    
+                    # Store selected stations for map display
+                    drone_state['selected_stations'] = selected_stations
+                    
+                    # Calculate position using trilateration with selected stations
                     position_updated = False
-                    if measurements and len(measurements) >= 3:
-                        calculated_pos = trilaterate_position(measurements)
+                    stations_available = len(measurements) if measurements else 0
+                    
+                    # FIXED: Reduce measurement requirement from 3 to 2 for better coverage
+                    # CRITICAL: Handle degraded mode when stations < 3
+                    if stations_available >= 2:
+                        calculated_pos = trilaterate_position(measurement_result)
                         if calculated_pos:
                             # Initialize Kalman filter if needed
                             if drone_state['kalman_filter'] is None:
@@ -1553,7 +1832,7 @@ async def simulate_drone_flight(stations):
                             )
                             
                             measured_position = {'lat': filtered_lat, 'lon': filtered_lon}
-                            drone_state['signal_quality'] = sum(m['signal_strength'] for m in measurements) / len(measurements)
+                            drone_state['signal_quality'] = sum(m['signal_strength'] for m in measurements) / len(measurements) if measurements else 0
                             
                             # HYBRID NAVIGATION: Apply correction for final waypoint segment
                             if drone_state.get('true_position') and len(route) > 0:
@@ -1575,7 +1854,9 @@ async def simulate_drone_flight(stations):
                             else:
                                 drone_state['position'] = measured_position
                             
-                            await broadcast_position(measurements)
+                            # Broadcast position with selected station IDs
+                            selected_station_ids = [m['station_id'] for m in measurements]
+                            await broadcast_position(measurements, selected_station_ids)
                             position_updated = True
                             drone_state['consecutive_failures'] = 0
                         else:
@@ -1583,22 +1864,57 @@ async def simulate_drone_flight(stations):
                     else:
                         drone_state['consecutive_failures'] = drone_state.get('consecutive_failures', 0) + 1
                     
-                    # Fallback: Dead reckoning if measurements fail
+                    # Fallback: Enhanced dead reckoning with route constraint for final waypoint
                     if not position_updated:
-                        if drone_state['position'] and drone_state['kalman_filter']:
+                        # CRITICAL FIX: Use route-constrained navigation when stations insufficient
+                        if drone_state.get('route') and drone_state.get('true_position'):
+                            # Use route position as primary source in low coverage
+                            route_pos = copy_waypoint(drone_state['true_position'])
+                            
+                            if drone_state['position'] and drone_state['kalman_filter']:
+                                kf = drone_state['kalman_filter']
+                                kf.predict()
+                                kf_pos = kf.get_position()
+                                
+                                # Blend: 85% route, 15% Kalman (trust route more)
+                                blended_pos = {
+                                    'lat': route_pos['lat'] * 0.85 + kf_pos['lat'] * 0.15,
+                                    'lon': route_pos['lon'] * 0.85 + kf_pos['lon'] * 0.15
+                                }
+                                
+                                # Check deviation from route to final waypoint
+                                final_waypoint = copy_waypoint(route[-1])
+                                route_deviation = calculate_distance_meters(
+                                    blended_pos['lat'], blended_pos['lon'],
+                                    route_pos['lat'], route_pos['lon']
+                                )
+                                
+                                if route_deviation > 30.0:  # If >30m off, use route position
+                                    drone_state['position'] = route_pos
+                                else:
+                                    drone_state['position'] = blended_pos
+                            else:
+                                drone_state['position'] = route_pos
+                            
+                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 0.5)
+                            await broadcast_position([], [])
+                        elif drone_state['position'] and drone_state['kalman_filter']:
                             kf = drone_state['kalman_filter']
                             kf.predict()
                             predicted_pos = kf.get_position()
                             drone_state['position'] = predicted_pos
-                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 5)
-                            await broadcast_position([])
+                            drone_state['signal_quality'] = max(0, drone_state['signal_quality'] - 1)
+                            await broadcast_position([], [])
                         elif drone_state['true_position']:
                             drone_state['position'] = copy_waypoint(drone_state['true_position'])
-                            await broadcast_position([])
+                            await broadcast_position([], [])
                         
-                        if drone_state.get('consecutive_failures', 0) >= max_consecutive_failures:
-                            await broadcast_low_signal_warning(stations, drone_state['true_position'])
-                            print(f"Warning: {drone_state['consecutive_failures']} consecutive measurement failures")
+                        # FIXED: Only warn every 10 failures to reduce log spam
+                        consecutive_failures = drone_state.get('consecutive_failures', 0)
+                        if consecutive_failures >= max_consecutive_failures:
+                            if consecutive_failures % 10 == 0:  # Only warn every 10 failures
+                                await broadcast_low_signal_warning(stations, drone_state.get('true_position') or drone_state.get('position'))
+                                print(f"Warning: {consecutive_failures} consecutive measurement failures")
             else:
                 # Debug: drone should be moving but isn't
                 debug_counter += 1
@@ -1617,19 +1933,45 @@ async def simulate_drone_flight(stations):
         # This provides 5x more position updates compared to the previous 2 Hz rate
         await asyncio.sleep(SIMULATION_UPDATE_INTERVAL_S)
 
-async def broadcast_position(measurements):
-    """Send calculated position to all connected clients"""
+async def broadcast_position(measurements, selected_station_ids=None):
+    """
+    Send calculated position to all connected clients
+    
+    Args:
+        measurements: List of measurement dictionaries (can be empty for fallback)
+        selected_station_ids: List of selected station IDs for display (optional)
+    """
     if drone_state['position'] and connected_clients:
+        # Extract station IDs from measurements if not provided
+        if selected_station_ids is None:
+            selected_station_ids = [m['station_id'] for m in measurements] if measurements else []
+        
         message = json.dumps({
             'type': 'location_update',
             'payload': {
                 'lat': drone_state['position']['lat'],
                 'lon': drone_state['position']['lon'],
                 'signal_quality': drone_state['signal_quality'],
-                'stations_used': [m['station_id'] for m in measurements]
+                'stations_used': selected_station_ids,  # Only selected stations
+                'selected_stations': selected_station_ids  # For map display
             }
         })
-        await asyncio.gather(*[client.send(message) for client in connected_clients])
+        
+        # FIXED: Handle disconnected clients gracefully to prevent crashes
+        disconnected_clients = set()
+        for client in connected_clients:
+            try:
+                await client.send(message)
+            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedOK, 
+                    websockets.exceptions.ConnectionClosedError, Exception) as e:
+                # Mark for removal but don't remove during iteration
+                disconnected_clients.add(client)
+                # Don't print every disconnection to reduce log spam
+                if len(disconnected_clients) == 1:  # Only log first disconnection
+                    pass  # Silent removal
+        
+        # Remove disconnected clients
+        connected_clients.difference_update(disconnected_clients)
 
 async def broadcast_low_signal_warning(stations, position):
     """Warn about low signal coverage areas"""
@@ -1656,43 +1998,172 @@ async def handle_client(websocket, stations):
         async for message in websocket:
             data = json.loads(message)
             
-            if data['type'] == 'set_route':
-                # Receive route from client (generated by 2GIS API)
-                waypoints = data['payload']['waypoints']
-                if waypoints and len(waypoints) >= 2:
-                    # Apply trajectory smoothing for fluid motion
-                    smoothed_waypoints = smooth_trajectory(waypoints, CURVATURE_SMOOTHING)
-                    
-                    drone_state['route'] = smoothed_waypoints
-                    drone_state['smoothed_route'] = smoothed_waypoints
-                    drone_state['route_index'] = 0
-                    drone_state['is_flying'] = True
-                    drone_state['true_position'] = copy_waypoint(smoothed_waypoints[0])
-                    drone_state['position'] = copy_waypoint(smoothed_waypoints[0])  # Initialize position too
-                    drone_state['consecutive_failures'] = 0
-                    drone_state['segment_progress'] = {}  # Reset segment progress
-                    # Reset velocity state for smooth motion
-                    drone_state['current_velocity'] = DRONE_SPEED_MPS
-                    drone_state['target_velocity'] = DRONE_SPEED_MPS
-                    drone_state['velocity_vector'] = {'lat': 0.0, 'lon': 0.0}
-                    # Reset Kalman filter for new route
-                    drone_state['kalman_filter'] = None
-                    # Initialize flight control system for new route
-                    drone_state['flight_control'] = FlightControlSystem()
-                    print(f"Route received: {len(waypoints)} waypoints (smoothed to {len(smoothed_waypoints)})")
-                    print(f"Starting position: lat={smoothed_waypoints[0]['lat']}, lon={smoothed_waypoints[0]['lon']}")
-                    print(f"Destination: lat={smoothed_waypoints[-1]['lat']}, lon={smoothed_waypoints[-1]['lon']}")
+            if data['type'] == 'set_start_location':
+                # Set starting location from predefined list
+                location_id = data['payload'].get('location_id')
+                if location_id:
+                    location = next((loc for loc in MOSCOW_DRONE_LOCATIONS if loc['id'] == location_id), None)
+                    if location:
+                        drone_state['selected_start_location'] = location
+                        drone_state['true_position'] = {'lat': location['lat'], 'lon': location['lon']}
+                        drone_state['position'] = {'lat': location['lat'], 'lon': location['lon']}
+                        # Reset Kalman filter for new location
+                        drone_state['kalman_filter'] = None
+                        # Reset flight state
+                        drone_state['is_flying'] = False
+                        drone_state['route'] = []
+                        drone_state['route_index'] = 0
+                        drone_state['signal_quality'] = 100  # Reset signal quality
+                        drone_state['consecutive_failures'] = 0
+                        # Initialize flight control system
+                        drone_state['flight_control'] = FlightControlSystem()
+                        # Broadcast position immediately so it appears on map
+                        await broadcast_position([], [])
+                        print(f"Starting location set to: {location['name']} ({location['lat']}, {location['lon']})")
+                    else:
+                        print(f"Error: Unknown location ID: {location_id}")
                 else:
-                    print(f"Error: Invalid route received (need at least 2 waypoints, got {len(waypoints) if waypoints else 0})")
+                    print("Error: No location_id provided in set_start_location")
+            
+            elif data['type'] == 'set_route':
+                # Receive route from client (generated by 2GIS API)
+                try:
+                    waypoints = data['payload'].get('waypoints', [])
+                    
+                    # FIXED: Validate waypoints format
+                    if not waypoints or not isinstance(waypoints, list):
+                        print(f"Error: Invalid waypoints format: {type(waypoints)}")
+                        return
+                    
+                    # Validate each waypoint has required fields
+                    valid_waypoints = []
+                    for wp in waypoints:
+                        if isinstance(wp, dict) and 'lat' in wp and 'lon' in wp:
+                            try:
+                                lat = float(wp['lat'])
+                                lon = float(wp['lon'])
+                                if not (math.isnan(lat) or math.isnan(lon)):
+                                    valid_waypoints.append({'lat': lat, 'lon': lon})
+                            except (ValueError, TypeError):
+                                continue
+                    
+                    if len(valid_waypoints) < 2:
+                        print(f"Error: Not enough valid waypoints ({len(valid_waypoints)} < 2)")
+                        return
+                    
+                    waypoints = valid_waypoints
+                    
+                    # FIXED: Limit route waypoints to prevent crashes on large routes
+                    MAX_WAYPOINTS = 500  # Maximum waypoints to prevent memory/performance issues
+                    if len(waypoints) > MAX_WAYPOINTS:
+                        print(f"Warning: Route has {len(waypoints)} waypoints, limiting to {MAX_WAYPOINTS} for performance")
+                        # Sample waypoints evenly across the route (FIXED: prevent index out of bounds)
+                        original_waypoints = waypoints.copy()
+                        step = (len(waypoints) - 1) / (MAX_WAYPOINTS - 1)  # Ensure we can reach last index
+                        sampled_waypoints = []
+                        for i in range(MAX_WAYPOINTS - 1):
+                            idx = int(i * step)
+                            if idx < len(original_waypoints):
+                                sampled_waypoints.append(original_waypoints[idx])
+                        # Always keep last waypoint
+                        if original_waypoints:
+                            sampled_waypoints.append(original_waypoints[-1])
+                        waypoints = sampled_waypoints
+                        print(f"Route simplified from {len(original_waypoints)} to {len(waypoints)} waypoints")
+                    
+                    if waypoints and len(waypoints) >= 2:
+                        # Use selected start location if available, otherwise use first waypoint
+                        start_pos = None
+                        if drone_state.get('selected_start_location'):
+                            start_pos = {
+                                'lat': drone_state['selected_start_location']['lat'],
+                                'lon': drone_state['selected_start_location']['lon']
+                            }
+                            # Replace first waypoint with selected start location for accurate trajectory
+                            waypoints[0] = start_pos
+                            print(f"Using selected start location: {drone_state['selected_start_location']['name']}")
+                        else:
+                            start_pos = copy_waypoint(waypoints[0])
+                            print("No start location selected, using first waypoint from route")
+                        
+                        # Apply trajectory smoothing for fluid motion
+                        smoothed_waypoints = smooth_trajectory(waypoints, CURVATURE_SMOOTHING)
+                        
+                        # Ensure first waypoint is the selected start location
+                        if start_pos:
+                            smoothed_waypoints[0] = copy_waypoint(start_pos)
+                        
+                        drone_state['route'] = smoothed_waypoints
+                        drone_state['smoothed_route'] = smoothed_waypoints
+                        drone_state['route_index'] = 0
+                        drone_state['is_flying'] = True
+                        drone_state['true_position'] = copy_waypoint(smoothed_waypoints[0])
+                        drone_state['position'] = copy_waypoint(smoothed_waypoints[0])  # Initialize position too
+                        drone_state['consecutive_failures'] = 0
+                        drone_state['segment_progress'] = {}  # Reset segment progress
+                        # Reset velocity state for smooth motion
+                        drone_state['current_velocity'] = DRONE_SPEED_MPS
+                        drone_state['target_velocity'] = DRONE_SPEED_MPS
+                        drone_state['velocity_vector'] = {'lat': 0.0, 'lon': 0.0}
+                        # Reset Kalman filter for new route
+                        drone_state['kalman_filter'] = None
+                        # Initialize flight control system for new route
+                        drone_state['flight_control'] = FlightControlSystem()
+                        print(f"Route received: {len(waypoints)} waypoints (smoothed to {len(smoothed_waypoints)})")
+                        print(f"Starting position: lat={smoothed_waypoints[0]['lat']}, lon={smoothed_waypoints[0]['lon']}")
+                        print(f"Destination: lat={smoothed_waypoints[-1]['lat']}, lon={smoothed_waypoints[-1]['lon']}")
+                    else:
+                        print(f"Error: Invalid route received (need at least 2 waypoints, got {len(waypoints) if waypoints else 0})")
+                except Exception as e:
+                    print(f"Error processing route: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             elif data['type'] == 'start_demo':
                 # Start demo flight from first station
-                if stations:
-                    drone_state['true_position'] = {'lat': stations[0]['lat'], 'lon': stations[0]['lon']}
-                    drone_state['position'] = drone_state['true_position']
+                if stations and len(stations) > 0:
+                    # Set position to first station
+                    start_pos = {'lat': stations[0]['lat'], 'lon': stations[0]['lon']}
+                    drone_state['true_position'] = copy_waypoint(start_pos)
+                    drone_state['position'] = copy_waypoint(start_pos)
+                    
+                    # Create a simple demo route: fly to second station if available, otherwise fly 1km north
+                    if len(stations) > 1:
+                        # Route to second station
+                        demo_route = [copy_waypoint(start_pos), copy_waypoint({'lat': stations[1]['lat'], 'lon': stations[1]['lon']})]
+                    else:
+                        # Route 1km north from first station
+                        demo_route = [
+                            copy_waypoint(start_pos),
+                            {'lat': start_pos['lat'] + 0.009, 'lon': start_pos['lon']}  # ~1km north
+                        ]
+                    
+                    # Apply trajectory smoothing
+                    smoothed_route = smooth_trajectory(demo_route, CURVATURE_SMOOTHING)
+                    smoothed_route[0] = copy_waypoint(start_pos)  # Ensure start is exact
+                    
+                    # Initialize flight state
+                    drone_state['route'] = smoothed_route
+                    drone_state['smoothed_route'] = smoothed_route
+                    drone_state['route_index'] = 0
+                    drone_state['is_flying'] = True
+                    drone_state['consecutive_failures'] = 0
+                    drone_state['segment_progress'] = {}
+                    drone_state['signal_quality'] = 100
+                    drone_state['current_velocity'] = DRONE_SPEED_MPS
+                    drone_state['target_velocity'] = DRONE_SPEED_MPS
+                    drone_state['velocity_vector'] = {'lat': 0.0, 'lon': 0.0}
+                    
                     # Reset Kalman filter for new demo
                     drone_state['kalman_filter'] = None
-                    await broadcast_position([])
+                    # Initialize flight control system
+                    drone_state['flight_control'] = FlightControlSystem()
+                    
+                    # Broadcast position immediately
+                    await broadcast_position([], [])
+                    print(f"Demo started: Flying from station {stations[0]['id']} to {'station ' + str(stations[1]['id']) if len(stations) > 1 else '1km north'}")
+                else:
+                    print("Error: No stations available for demo")
             
             elif data['type'] == 'stop':
                 drone_state['is_flying'] = False

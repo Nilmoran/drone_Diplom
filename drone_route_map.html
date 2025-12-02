@@ -55,10 +55,26 @@
     <div id="map"></div>
     <div class="info-box">
         <h3>🚁 UAV Navigation System</h3>
-        <p><b>Instructions:</b> Click on the map to set destination. The UAV position is calculated via trilateration from LTE base stations.</p>
+        <p><b>Instructions:</b></p>
+        <ol style="margin: 5px 0; padding-left: 20px; font-size: 12px;">
+            <li><b>Select Starting Point (Point A):</b> Choose a location from the dropdown above. Click "Set Starting Point" to confirm.</li>
+            <li><b>Set Destination (Point B):</b> Click anywhere on the map to set your destination.</li>
+            <li><b>Watch the Flight:</b> The drone will follow the calculated route accurately from Point A to Point B.</li>
+        </ol>
+        <p style="font-size: 11px; color: #aaa; margin-top: 8px;"><i>The UAV position is calculated via trilateration from LTE base stations for precise navigation.</i></p>
         
         <div class="controls-section">
             <b>Server Status:</b> <span id="server_status" class="status-connecting">Connecting...</span>
+        </div>
+        
+        <div class="controls-section">
+            <b>📍 Select Starting Point (Point A):</b>
+            <p style="font-size: 11px; color: #aaa; margin: 5px 0;">Choose a starting location from the list below. This will be your drone's initial position (Point A).</p>
+            <select id="startLocationSelect" style="width: 100%; padding: 8px; margin-top: 5px; background: rgba(255,255,255,0.1); border: 1px solid rgba(100, 150, 255, 0.3); border-radius: 4px; color: #e0e0e0; font-size: 13px;">
+                <option value="">-- Select Starting Location --</option>
+            </select>
+            <button id="setStartLocationButton" style="width: 100%; margin-top: 8px; padding: 8px; font-size: 13px; border: none; border-radius: 6px; background: linear-gradient(135deg, #00aa44, #00cc66); color: white; cursor: pointer; box-shadow: 0 2px 8px rgba(0, 200, 100, 0.3); transition: all 0.2s ease;" disabled>Set Starting Point</button>
+            <p id="selectedStartLocation" style="font-size: 11px; color: #4a9eff; margin: 5px 0; font-style: italic;"></p>
         </div>
         
         <div class="controls-section">
@@ -103,6 +119,7 @@
             const initialCenterLat = JSON.parse('55.7558');
             const initialCenterLon = JSON.parse('37.6173');
             const initialZoom = JSON.parse('12');
+            const droneLocations = JSON.parse('[{"description": "SAO - Rechnoy Vokzal", "id": "rechnoy_vokzal", "lat": 55.8519, "lon": 37.4721, "name": "Rechnoy Vokzal"}, {"description": "Moscow Kremlin", "id": "kremlin", "lat": 55.752, "lon": 37.6156, "name": "Kremlin"}, {"description": "Sparrow Hills observation point", "id": "sparrow_hills", "lat": 55.7108, "lon": 37.5532, "name": "Sparrow Hills"}, {"description": "VDNKh Exhibition Center", "id": "vdnh", "lat": 55.8304, "lon": 37.6214, "name": "VDNKh"}, {"description": "Kutuzovsky Prospect area", "id": "kutuzovsky", "lat": 55.7444, "lon": 37.5364, "name": "Kutuzovsky Prospect"}, {"description": "Tverskaya Street - main street", "id": "tverskaya", "lat": 55.7558, "lon": 37.6056, "name": "Tverskaya Street"}, {"description": "Gorky Central Park of Culture", "id": "gorky_park", "lat": 55.732, "lon": 37.6014, "name": "Gorky Park"}, {"description": "Ostankino TV Tower area", "id": "ostankino", "lat": 55.8197, "lon": 37.6117, "name": "Ostankino Tower"}, {"description": "Luzhniki Olympic Complex", "id": "luzhniki", "lat": 55.7158, "lon": 37.5536, "name": "Luzhniki Stadium"}, {"description": "Sheremetyevo International Airport", "id": "sheremetyevo", "lat": 55.9736, "lon": 37.4145, "name": "Sheremetyevo Airport"}, {"description": "Domodedovo Airport area", "id": "domodedovo", "lat": 55.4143, "lon": 37.9005, "name": "Domodedovo Airport"}, {"description": "Izmailovo Park and Market", "id": "izmailovo", "lat": 55.7879, "lon": 37.7704, "name": "Izmailovo Park"}, {"description": "Kolomenskoye Museum-Reserve", "id": "kolomenskoye", "lat": 55.667, "lon": 37.668, "name": "Kolomenskoye"}, {"description": "Tsaritsyno Museum-Reserve", "id": "tsaritsyno", "lat": 55.62, "lon": 37.682, "name": "Tsaritsyno Park"}]');
             
             // Wait for mapgl library to load
             function waitForMapgl(callback, maxAttempts = 50) {
@@ -150,11 +167,15 @@
                 let stationMarkers = [], stationCircles = [], stationsVisible = true;
                 let intersectionMarkers = [], warningCircles = [], currentRouteWaypoints = [];
                 let socket = null;
+                let selectedStationIds = new Set();  // Track selected station IDs for display
                 
                 // DOM elements
                 const resetButton = document.getElementById('resetButton');
                 const startDemoButton = document.getElementById('startDemoButton');
                 const toggleStationsButton = document.getElementById('toggleStationsButton');
+                const startLocationSelect = document.getElementById('startLocationSelect');
+                const setStartLocationButton = document.getElementById('setStartLocationButton');
+                const selectedStartLocation = document.getElementById('selectedStartLocation');
                 const pointA_coords = document.getElementById('pointA_coords');
                 const pointB_coords = document.getElementById('pointB_coords');
                 const route_length_span = document.getElementById('route_length');
@@ -165,6 +186,54 @@
                 const stations_list_elem = document.getElementById('stations_list');
                 const signal_bar = document.getElementById('signal_bar');
                 const active_stations = document.getElementById('active_stations');
+                
+                // Populate starting location dropdown
+                if (droneLocations && Array.isArray(droneLocations)) {
+                    droneLocations.forEach(loc => {
+                        const option = document.createElement('option');
+                        option.value = loc.id;
+                        option.textContent = `${loc.name} - ${loc.description}`;
+                        startLocationSelect.appendChild(option);
+                    });
+                }
+                
+                // Enable/disable set button based on selection
+                startLocationSelect.addEventListener('change', () => {
+                    setStartLocationButton.disabled = !startLocationSelect.value;
+                });
+                
+                // Set starting location
+                setStartLocationButton.addEventListener('click', () => {
+                    const locationId = startLocationSelect.value;
+                    if (locationId && socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({
+                            type: 'set_start_location',
+                            payload: { location_id: locationId }
+                        }));
+                        const selectedLoc = droneLocations.find(loc => loc.id === locationId);
+                        if (selectedLoc) {
+                            selectedStartLocation.textContent = `✓ Selected: ${selectedLoc.name}`;
+                            // Update point A display
+                            pointA_coords.textContent = `${selectedLoc.lat.toFixed(4)}, ${selectedLoc.lon.toFixed(4)}`;
+                            // Update drone marker if it exists
+                            if (droneLocation) {
+                                updateDroneLocation(selectedLoc.lat, selectedLoc.lon, 100, [], []);
+                            } else {
+                                // Create drone marker at selected location
+                                if (droneMarker) droneMarker.destroy();
+                                droneMarker = new mapgl.Marker(map, {
+                                    coordinates: [selectedLoc.lon, selectedLoc.lat],
+                                    icon: './icons/drone.png',
+                                    size: [48, 48]
+                                });
+                                map.setCenter([selectedLoc.lon, selectedLoc.lat], { duration: 500 });
+                            }
+                            console.log(`Starting location set to: ${selectedLoc.name}`);
+                        }
+                    } else if (!socket || socket.readyState !== WebSocket.OPEN) {
+                        alert('WebSocket not connected. Please wait for connection and try again.');
+                    }
+                });
                 
                 // Utility functions
                 function toRadians(d) { return d * Math.PI / 180; }
@@ -190,39 +259,110 @@
                     stationCircles = []; 
                     stations_list_elem.innerHTML = ''; 
                     
-                    const nearbyStations = droneLocation 
-                        ? stationsData.filter(s => calculateDistanceMeters(droneLocation.lat, droneLocation.lon, s.lat, s.lon) <= STATION_VISIBILITY_RADIUS)
-                        : [];
+                    // Only show selected stations (up to MAX_TOWERS_TO_SELECT = 7)
+                    // Filter stations to only include those in selectedStationIds
+                    const stationsToShow = stationsData.filter(s => selectedStationIds.has(s.id));
                     
-                    nearbyStations.forEach(s => { 
+                    // If no selected stations yet, show nearby stations (fallback for initial state)
+                    const stationsToDisplay = stationsToShow.length > 0 
+                        ? stationsToShow 
+                        : (droneLocation 
+                            ? stationsData.filter(s => calculateDistanceMeters(droneLocation.lat, droneLocation.lon, s.lat, s.lon) <= STATION_VISIBILITY_RADIUS)
+                            : []);
+                    
+                    stationsToDisplay.forEach(s => { 
                         const color = operatorColors[s.operator] || operatorColors['default']; 
+                        // Highlight selected stations with a different style
+                        const isSelected = selectedStationIds.has(s.id);
+                        const markerLabel = isSelected 
+                            ? `📡 ${s.id} (${s.operator}) ⭐` 
+                            : `📡 ${s.id} (${s.operator})`;
+                        
                         stationMarkers.push(new mapgl.Marker(map, { 
                             coordinates: [s.lon, s.lat], 
-                            label: { text: `📡 ${s.id} (${s.operator})`, color: color, fontSize: 12, stroke: 'white' } 
+                            label: { text: markerLabel, color: color, fontSize: 12, stroke: 'white' } 
                         })); 
                         stationCircles.push(new mapgl.Circle(map, { 
                             coordinates: [s.lon, s.lat], 
                             radius: s.radius, 
-                            color: 'rgba(100, 150, 255, 0.1)', 
+                            color: isSelected ? 'rgba(100, 255, 100, 0.15)' : 'rgba(100, 150, 255, 0.1)', 
                             stroke: color, 
-                            strokeWidth: 2,
+                            strokeWidth: isSelected ? 3 : 2,  // Thicker stroke for selected stations
                             interactive: false 
                         })); 
                         const li = document.createElement('li'); 
-                        li.innerHTML = `<span style="color: ${color}; font-weight: bold;">●</span> ID ${s.id} (${s.operator}) - ${s.radius}m`; 
+                        const selectedIndicator = isSelected ? ' ⭐ SELECTED' : '';
+                        li.innerHTML = `<span style="color: ${color}; font-weight: ${isSelected ? 'bold' : 'normal'};};">●</span> ID ${s.id} (${s.operator}) - ${s.radius}m${selectedIndicator}`; 
                         stations_list_elem.appendChild(li); 
                     }); 
                     toggleStationsButton.textContent = 'Hide Stations'; 
                 }
                 
                 function renderRouteLine(coords) { 
-                    if (routeLine) routeLine.destroy(); 
-                    routeLine = new mapgl.Polyline(map, { 
-                        coordinates: coords, 
-                        width: 5, 
-                        color: '#00aaff',
-                        dashArray: [10, 5]
-                    }); 
+                    if (routeLine) {
+                        try {
+                            routeLine.destroy(); 
+                        } catch (e) {
+                            // Ignore errors when destroying
+                        }
+                    }
+                    routeLine = null;
+                    
+                    // FIXED: Ensure route line is always rendered, even for small routes
+                    if (coords && Array.isArray(coords) && coords.length >= 2) {
+                        // Validate coordinates
+                        const validCoords = coords.filter(c => 
+                            Array.isArray(c) && 
+                            c.length >= 2 && 
+                            typeof c[0] === 'number' && 
+                            typeof c[1] === 'number' &&
+                            !isNaN(c[0]) && 
+                            !isNaN(c[1])
+                        );
+                        
+                        if (validCoords.length < 2) {
+                            console.warn('Not enough valid coordinates to render route line');
+                            return;
+                        }
+                        
+                        try {
+                            // For very long routes, sample coordinates to prevent performance issues
+                            let coordsToRender = validCoords;
+                            if (validCoords.length > 1000) {
+                                const step = Math.ceil(validCoords.length / 1000);
+                                coordsToRender = validCoords.filter((_, i) => i % step === 0 || i === validCoords.length - 1);
+                                console.log(`Route simplified from ${validCoords.length} to ${coordsToRender.length} points for rendering`);
+                            }
+                            
+                            routeLine = new mapgl.Polyline(map, { 
+                                coordinates: coordsToRender, 
+                                width: 5, 
+                                color: '#00aaff',
+                                dashArray: [10, 5]
+                            }); 
+                            console.log(`Route line rendered with ${coordsToRender.length} points`);
+                        } catch (error) {
+                            console.error('Error rendering route line:', error);
+                            // Try with even fewer points as fallback
+                            if (validCoords.length > 10) {
+                                const step = Math.ceil(validCoords.length / 50);
+                                const sampled = validCoords.filter((_, i) => i % step === 0 || i === validCoords.length - 1);
+                                try {
+                                    routeLine = new mapgl.Polyline(map, { 
+                                        coordinates: sampled, 
+                                        width: 5, 
+                                        color: '#00aaff',
+                                        dashArray: [10, 5]
+                                    }); 
+                                    console.log(`Route line rendered with fallback sampling: ${sampled.length} points`);
+                                } catch (fallbackError) {
+                                    console.error('Fallback route rendering also failed:', fallbackError);
+                                }
+                            }
+                        }
+                    } else {
+                        console.warn('Invalid coordinates for route line:', coords);
+                    }
                 }
                 
                 function renderManeuvers(maneuvers) { 
@@ -285,7 +425,25 @@
                         
                         if (coords.length > 0) { 
                             currentRouteWaypoints = coords;
-                            renderRouteLine(coords.map(c => [c.lon, c.lat])); 
+                            
+                            // FIXED: Always render route line, even for small routes
+                            const routeCoords = coords.map(c => {
+                                // Validate coordinate format
+                                if (c && typeof c.lon === 'number' && typeof c.lat === 'number' && 
+                                    !isNaN(c.lon) && !isNaN(c.lat)) {
+                                    return [c.lon, c.lat];
+                                }
+                                return null;
+                            }).filter(c => c !== null);
+                            
+                            if (routeCoords.length >= 2) {
+                                renderRouteLine(routeCoords);
+                            } else {
+                                console.error('Not enough valid coordinates after filtering');
+                                alert('Error: Route coordinates are invalid. Please try selecting a different destination.');
+                                return;
+                            }
+                            
                             renderManeuvers(routeData.maneuvers); 
                             route_length_span.textContent = `${(routeData.total_distance / 1000).toFixed(2)} km`; 
                             renderIntersectionPoints(analyzeRouteForIntersections(coords, stationsData)); 
@@ -293,11 +451,16 @@
                             // Send route to server for drone navigation
                             // This will update the route even if drone is currently flying
                             if (socket && socket.readyState === WebSocket.OPEN) {
-                                socket.send(JSON.stringify({
-                                    type: 'set_route',
-                                    payload: { waypoints: coords }
-                                }));
-                                console.log(`Route sent to server: ${coords.length} waypoints`);
+                                try {
+                                    socket.send(JSON.stringify({
+                                        type: 'set_route',
+                                        payload: { waypoints: coords }
+                                    }));
+                                    console.log(`Route sent to server: ${coords.length} waypoints`);
+                                } catch (sendError) {
+                                    console.error('Error sending route to server:', sendError);
+                                    alert('Warning: Could not send route to server. Route displayed but drone may not follow it.');
+                                }
                             } else {
                                 console.warn('WebSocket not connected, route not sent to server');
                                 alert('Warning: WebSocket not connected. Route displayed but not sent to drone. Please check connection.');
@@ -312,7 +475,7 @@
                     } 
                 }
                 
-                function updateDroneLocation(lat, lon, signalQuality, stationsUsed) { 
+                function updateDroneLocation(lat, lon, signalQuality, stationsUsed, selectedStations) { 
                     clearWarningCircles(); 
                     droneLocation = { lat, lon }; 
                     pointA_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
@@ -325,7 +488,13 @@
                             ? 'linear-gradient(90deg, #ffaa00, #ffcc00)'
                             : 'linear-gradient(90deg, #ff4444, #ff6666)';
                     
-                    // Update active stations
+                    // Update selected station IDs for display filtering
+                    if (selectedStations && selectedStations.length > 0) {
+                        selectedStationIds = new Set(selectedStations);
+                        console.log(`Selected stations for trilateration: ${Array.from(selectedStationIds).join(', ')}`);
+                    }
+                    
+                    // Update active stations display
                     if (stationsUsed && stationsUsed.length > 0) {
                         active_stations.textContent = stationsUsed.join(', ');
                     }
@@ -339,6 +508,21 @@
                     } else { 
                         droneMarker.setCoordinates([lon, lat]); 
                     } 
+                    
+                    // FIXED: Ensure route line persists during flight
+                    // Re-render route line if it was destroyed or doesn't exist
+                    if (!routeLine && currentRouteWaypoints && currentRouteWaypoints.length >= 2) {
+                        const routeCoords = currentRouteWaypoints.map(c => {
+                            if (c && typeof c.lon === 'number' && typeof c.lat === 'number' && 
+                                !isNaN(c.lon) && !isNaN(c.lat)) {
+                                return [c.lon, c.lat];
+                            }
+                            return null;
+                        }).filter(c => c !== null);
+                        if (routeCoords.length >= 2) {
+                            renderRouteLine(routeCoords);
+                        }
+                    }
                     
                     // Smooth camera follow
                     map.setCenter([lon, lat], { duration: 300 });
@@ -372,11 +556,14 @@
                                 
                                 if (data.type === 'location_update') { 
                                     if (data.payload.lat && data.payload.lon) { 
+                                        // Extract selected stations (preferred) or fallback to stations_used
+                                        const selectedStations = data.payload.selected_stations || data.payload.stations_used || [];
                                         updateDroneLocation(
                                             data.payload.lat, 
                                             data.payload.lon,
                                             data.payload.signal_quality,
-                                            data.payload.stations_used
+                                            data.payload.stations_used,
+                                            selectedStations  // Pass selected stations for filtering
                                         ); 
                                     } 
                                 } else if (data.type === 'warning_low_signal') { 
@@ -434,22 +621,40 @@
                     
                     pointB_coords.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; 
                     
-                    // FIXED: Always allow route setting, with intelligent fallback
-                    // Use current drone location if available, otherwise use route start or map center
+                    // IMPROVED: Use selected start location if available, otherwise intelligent fallback
                     let routeStart = null;
                     
-                    if (droneLocation) {
-                        // Use current drone position
+                    // Priority 1: Use selected start location from dropdown
+                    const selectedLocationId = startLocationSelect.value;
+                    if (selectedLocationId) {
+                        const selectedLoc = droneLocations.find(loc => loc.id === selectedLocationId);
+                        if (selectedLoc) {
+                            routeStart = { lat: selectedLoc.lat, lon: selectedLoc.lon };
+                            console.log(`Using selected start location: ${selectedLoc.name}`);
+                        }
+                    }
+                    
+                    // Priority 2: Use current drone location if no selection
+                    if (!routeStart && droneLocation) {
                         routeStart = droneLocation;
-                    } else if (currentRouteWaypoints && currentRouteWaypoints.length > 0) {
-                        // Use start of current route if drone position not yet available
+                        console.log('Using current drone position for route calculation');
+                    }
+                    
+                    // Priority 3: Use start of current route if drone position not yet available
+                    if (!routeStart && currentRouteWaypoints && currentRouteWaypoints.length > 0) {
                         routeStart = currentRouteWaypoints[0];
                         console.log('Using route start as fallback for route calculation');
-                    } else {
-                        // Use map center as last resort
+                    }
+                    
+                    // Priority 4: Use map center as last resort
+                    if (!routeStart) {
                         const center = map.getCenter();
                         routeStart = { lat: center[1], lon: center[0] };
                         console.log('Using map center as fallback for route calculation');
+                        // Warn user to select a starting point
+                        if (!selectedLocationId) {
+                            alert('Please select a starting point (Point A) from the dropdown for accurate trajectory following.');
+                        }
                     }
                     
                     // Check distance - reduced threshold from 10m to 1m to allow closer waypoints
@@ -461,7 +666,12 @@
                     } else {
                         // Points are too close - provide user feedback
                         console.warn('Destination too close to start point (< 1m), route not fetched');
-                        alert('Destination is too close to the start point. Please select a destination further away.');
+                        alert('Destination is too close to the start point. Please select a destination further away (at least 1 meter).');
+                    }
+                    
+                    // Remind user to select starting point if not selected
+                    if (!startLocationSelect.value) {
+                        console.log('Route will use fallback starting point. Consider selecting a starting location for better accuracy.');
                     }
                 });
                 
@@ -493,6 +703,9 @@
                     intersection_points_list.innerHTML = ''; 
                     signal_bar.style.width = '0%';
                     active_stations.textContent = '-';
+                    selectedStartLocation.textContent = '';
+                    startLocationSelect.value = '';
+                    setStartLocationButton.disabled = true;
                     
                     if (socket && socket.readyState === WebSocket.OPEN) {
                         socket.send(JSON.stringify({ type: 'stop' }));
