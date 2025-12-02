@@ -1104,42 +1104,67 @@ def calculate_correction_vector(measured_pos, route_start, route_end, route_prog
     }
 
 def apply_hybrid_navigation(route_pos, measured_pos, route_start, route_end, route_progress, signal_quality):
-    """Hybrid navigation: combine route following with trilateration correction"""
+    """Hybrid navigation: combine route following with trilateration correction
+    
+    CRITICAL FIX: Trust route more when trilateration shows large deviations.
+    Large deviations are likely measurement noise, not route errors.
+    """
     # Calculate correction
     correction = calculate_correction_vector(measured_pos, route_start, route_end, route_progress)
+    deviation = correction['deviation']
     
-    # Determine correction strength based on:
-    # 1. Signal quality (better signal = trust trilateration more)
-    # 2. Deviation magnitude (larger deviation = apply more correction)
-    # 3. Maximum correction to prevent overcorrection
+    # CRITICAL FIX: Trust route when trilateration deviates significantly
+    # Large deviations (>15m) are likely measurement noise, not route errors
+    # Small deviations (<5m) might be real, apply small correction
     
     # Base correction strength from signal quality (0.0 to 1.0)
     signal_factor = signal_quality / 100.0
     
-    # Deviation factor: stronger correction for larger deviations, but cap it
-    max_deviation = 50.0  # meters - beyond this, trust route completely
-    deviation_factor = min(1.0, correction['deviation'] / max_deviation)
+    # CRITICAL: Deviation-based trust factor
+    # Small deviation (<5m): trust trilateration (might be accurate)
+    # Medium deviation (5-15m): reduce trust (likely noise)
+    # Large deviation (>15m): minimal trust (definitely noise)
+    if deviation < 5.0:
+        # Small deviation: might be accurate, apply moderate correction
+        deviation_trust = 0.6  # Trust trilateration 60%
+    elif deviation < 15.0:
+        # Medium deviation: likely noise, minimal correction
+        deviation_trust = 0.2  # Trust trilateration 20%
+    else:
+        # Large deviation: definitely noise, trust route
+        deviation_trust = 0.05  # Trust trilateration 5% (minimal)
     
-    # Correction strength: blend of signal quality and deviation
-    # High signal + small deviation = trust trilateration (apply correction)
-    # Low signal OR large deviation = trust route (minimal correction)
-    correction_strength = signal_factor * (1.0 - deviation_factor * 0.5)
+    # Correction strength: blend of signal quality and deviation trust
+    # High signal + small deviation = trust trilateration
+    # Low signal OR large deviation = trust route
+    correction_strength = signal_factor * deviation_trust
+    
+    # CRITICAL FIX: Reduced maximum correction from 30% to 12%
+    # This prevents noisy trilateration from pulling drone too far from route
+    max_correction_factor = 0.12  # Reduced from 0.3
     
     # Apply correction with adaptive strength
-    corrected_lat = route_pos['lat'] + correction['lat'] * correction_strength * 0.3  # 30% max correction
-    corrected_lon = route_pos['lon'] + correction['lon'] * correction_strength * 0.3
+    corrected_lat = route_pos['lat'] + correction['lat'] * correction_strength * max_correction_factor
+    corrected_lon = route_pos['lon'] + correction['lon'] * correction_strength * max_correction_factor
     
-    # Safety: if deviation is too large, snap back to route
-    if correction['deviation'] > 30.0:  # More than 30 meters off
-        # Use route position with slight correction
-        corrected_lat = route_pos['lat'] + correction['lat'] * 0.1
-        corrected_lon = route_pos['lon'] + correction['lon'] * 0.1
+    # CRITICAL FIX: Route constraint - if result deviates too much, snap to route
+    # This prevents trilateration noise from pulling drone away from accurate route
+    result_deviation = calculate_distance_meters(
+        corrected_lat, corrected_lon,
+        route_pos['lat'], route_pos['lon']
+    )
+    
+    if result_deviation > 15.0:  # If hybrid result is >15m from route
+        # Snap back to route - trilateration is too noisy
+        corrected_lat = route_pos['lat']
+        corrected_lon = route_pos['lon']
+        correction_strength = 0.0  # No correction applied
     
     return {
         'lat': corrected_lat,
         'lon': corrected_lon,
-        'deviation': correction['deviation'],
-        'correction_applied': correction_strength > 0.1
+        'deviation': deviation,
+        'correction_applied': correction_strength > 0.05
     }
 
 async def simulate_drone_flight(stations):
@@ -1654,19 +1679,18 @@ async def simulate_drone_flight(stations):
                                 if loop_count % 20 == 0 and hybrid_result['deviation'] > 5.0:
                                     print(f"Route deviation: {hybrid_result['deviation']:.1f}m, correction_active={hybrid_result['correction_applied']}, signal={drone_state['signal_quality']:.1f}%")
                                 
-                                # If deviation is significant, apply gentle correction to route position
-                                # This allows the route to gradually correct for systematic trilateration errors
-                                if hybrid_result['deviation'] > 10.0 and hybrid_result['correction_applied']:
-                                    # Gently pull route position toward measured position (max 10% correction)
-                                    correction_factor = min(0.1, hybrid_result['deviation'] / 100.0)
-                                    drone_state['true_position'] = {
-                                        'lat': drone_state['true_position']['lat'] + 
-                                               (hybrid_result['lat'] - drone_state['true_position']['lat']) * correction_factor,
-                                        'lon': drone_state['true_position']['lon'] + 
-                                               (hybrid_result['lon'] - drone_state['true_position']['lon']) * correction_factor
-                                    }
-                                    if loop_count % 20 == 0:
-                                        print(f"Applied route correction: {correction_factor*100:.1f}% toward measured position")
+                                # CRITICAL FIX: Removed route correction feedback loop
+                                # This was causing the drone to drift away from accurate route
+                                # Route is ground truth - don't modify it based on noisy trilateration measurements
+                                # 
+                                # Previous code pulled route toward noisy measurements, creating feedback loop:
+                                # 1. Trilateration has noise → shows 20m deviation
+                                # 2. Route correction pulls route toward noisy measurement
+                                # 3. Next cycle: route is wrong, trilateration shows different error
+                                # 4. Process repeats → drone oscillates
+                                #
+                                # Solution: Trust route as ground truth, only use trilateration for small corrections
+                                # Route position remains accurate, trilateration provides minor adjustments only
                             else:
                                 # Fallback: use measured position directly
                                 drone_state['position'] = measured_position
