@@ -10,6 +10,8 @@ import json
 import math
 import random
 import asyncio
+import csv
+from datetime import datetime
 from jinja2 import Environment, FileSystemLoader
 import sqlite3
 
@@ -76,7 +78,7 @@ VELOCITY_SMOOTHING_ALPHA = 0.6  # Velocity smoothing factor (exponential moving 
 
 # Predefined drone starting locations in Moscow
 MOSCOW_DRONE_LOCATIONS = [
-    {'id': 'rechnoy_vokzal', 'name': 'Rechnoy Vokzal', 'lat': 55.8519, 'lon': 37.4721, 'description': 'SAO - Rechnoy Vokzal'},
+    {'id': 'rechnoy_vokzal', 'name': 'Rechnoy Vokzal', 'lat': 55.8364, 'lon': 37.5376, 'description': 'SAO - Rechnoy Vokzal'},
     {'id': 'kremlin', 'name': 'Kremlin', 'lat': 55.7520, 'lon': 37.6156, 'description': 'Moscow Kremlin'},
     {'id': 'sparrow_hills', 'name': 'Sparrow Hills', 'lat': 55.7108, 'lon': 37.5532, 'description': 'Sparrow Hills observation point'},
     {'id': 'vdnh', 'name': 'VDNKh', 'lat': 55.8304, 'lon': 37.6214, 'description': 'VDNKh Exhibition Center'},
@@ -520,12 +522,38 @@ def calculate_distance_meters(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 def simulate_lte_signal_strength(distance, station_radius):
-    """Simulate LTE-Advanced signal strength based on distance"""
+    """Simulate LTE-Advanced signal strength based on distance with urban path loss"""
     if distance > station_radius:
         return 0
-    # Path loss model for LTE (simplified)
-    path_loss = 20 * math.log10(distance + 1) + 20 * math.log10(LTE_FREQUENCY_MHZ) - 27.55
-    signal_strength = max(0, 100 - path_loss / 2)
+    
+    # Urban path loss model for LTE (учитывает городские условия)
+    # Free space path loss: 20*log10(d) + 20*log10(f) - 27.55
+    free_space_loss = 20 * math.log10(distance + 1) + 20 * math.log10(LTE_FREQUENCY_MHZ) - 27.55
+    
+    # Дополнительные городские потери (из-за зданий, препятствий, отражений)
+    # Потери увеличиваются с расстоянием (больше препятствий на пути)
+    urban_loss_factor = 1.0 + (distance / station_radius) * 0.8  # Дополнительные 0-80% потерь
+    urban_loss = 10 * math.log10(urban_loss_factor)  # Преобразуем в дБ
+    
+    # Общие потери = свободное пространство + городские потери
+    total_path_loss = free_space_loss + urban_loss
+    
+    # Нормализация к шкале 0-100%
+    # At close range (50m): ~95-100%
+    # At medium range (500m): ~60-70% (с учетом городских потерь)
+    # At far range (1500m): ~20-30% (с учетом городских потерь)
+    baseline_path_loss = 20 * math.log10(50) + 20 * math.log10(LTE_FREQUENCY_MHZ) - 27.55  # Reference at 50m
+    path_loss_diff = total_path_loss - baseline_path_loss
+    
+    # Масштабирование с учетом городских потерь
+    # Более агрессивное затухание для городской среды
+    signal_strength = max(0, min(100, 100 - path_loss_diff / 0.9))  # Более агрессивное затухание
+    
+    # Гарантируем, что на границе (1500м) сигнал все еще ненулевой (минимум 15-20%)
+    # Это важно для навигации - станция должна быть доступна до границы радиуса
+    if distance >= station_radius * 0.9:  # Последние 10% радиуса
+        signal_strength = max(signal_strength, 15)  # Минимум 15% на границе
+    
     return signal_strength
 
 def measure_ranges_from_stations(true_lat, true_lon, stations):
@@ -1167,6 +1195,98 @@ def apply_hybrid_navigation(route_pos, measured_pos, route_start, route_end, rou
         'correction_applied': correction_strength > 0.05
     }
 
+# CSV статистика полета
+FLIGHT_STATS_CSV = 'flight_statistics.csv'
+_flight_stats_file = None
+_flight_stats_writer = None
+_flight_stats_initialized = False
+
+def init_flight_statistics():
+    """Инициализация CSV файла для статистики полета"""
+    global _flight_stats_file, _flight_stats_writer, _flight_stats_initialized
+    
+    if _flight_stats_initialized:
+        return
+    
+    # Создаем CSV файл с заголовками
+    file_exists = os.path.exists(FLIGHT_STATS_CSV)
+    
+    try:
+        _flight_stats_file = open(FLIGHT_STATS_CSV, 'a', newline='', encoding='utf-8')
+        _flight_stats_writer = csv.writer(_flight_stats_file)
+        
+        # Записываем заголовки только если файл новый
+        if not file_exists:
+            headers = [
+                'timestamp',
+                'true_lat', 'true_lon',
+                'measured_lat', 'measured_lon',
+                'position_error_m',
+                'num_stations',
+                'avg_signal_strength',
+                'min_distance_to_station',
+                'max_distance_to_station',
+                'route_deviation_m',
+                'trilateration_success'
+            ]
+            _flight_stats_writer.writerow(headers)
+            _flight_stats_file.flush()
+        
+        _flight_stats_initialized = True
+        print(f"Flight statistics initialized: {FLIGHT_STATS_CSV}")
+    except Exception as e:
+        print(f"Error initializing flight statistics: {e}")
+
+def write_flight_statistics(
+    true_pos, measured_pos, position_error,
+    num_stations, avg_signal, distances_to_stations,
+    route_deviation, trilateration_success
+):
+    """Запись статистики полета в CSV файл"""
+    global _flight_stats_file, _flight_stats_writer
+    
+    if not _flight_stats_initialized:
+        init_flight_statistics()
+    
+    if not _flight_stats_writer:
+        return
+    
+    try:
+        min_distance = min(distances_to_stations) if distances_to_stations else 0
+        max_distance = max(distances_to_stations) if distances_to_stations else 0
+        
+        row = [
+            datetime.now().isoformat(),
+            true_pos['lat'] if true_pos else '',
+            true_pos['lon'] if true_pos else '',
+            measured_pos['lat'] if measured_pos else '',
+            measured_pos['lon'] if measured_pos else '',
+            position_error,
+            num_stations,
+            avg_signal,
+            min_distance,
+            max_distance,
+            route_deviation,
+            1 if trilateration_success else 0
+        ]
+        
+        _flight_stats_writer.writerow(row)
+        _flight_stats_file.flush()
+    except Exception as e:
+        print(f"Error writing flight statistics: {e}")
+
+def close_flight_statistics():
+    """Закрытие CSV файла статистики"""
+    global _flight_stats_file, _flight_stats_initialized
+    
+    if _flight_stats_file:
+        try:
+            _flight_stats_file.close()
+        except:
+            pass
+        _flight_stats_file = None
+        _flight_stats_initialized = False
+
 async def simulate_drone_flight(stations):
     """Main drone flight simulation loop with improved error handling
     
@@ -1700,6 +1820,62 @@ async def simulate_drone_flight(stations):
                             await broadcast_position(measurements, selected_station_ids)
                             position_updated = True
                             drone_state['consecutive_failures'] = 0
+                            
+                            # Записываем статистику полета в CSV
+                            try:
+                                # Вычисляем ошибку позиционирования
+                                position_error = calculate_distance_meters(
+                                    drone_state['true_position']['lat'],
+                                    drone_state['true_position']['lon'],
+                                    drone_state['position']['lat'],
+                                    drone_state['position']['lon']
+                                )
+                                
+                                # Вычисляем реальные расстояния до станций (без шума измерения)
+                                distances_to_stations = []
+                                for m in measurements:
+                                    # Вычисляем реальное расстояние от истинной позиции до станции
+                                    station_lat = m.get('lat')
+                                    station_lon = m.get('lon')
+                                    if station_lat and station_lon:
+                                        true_dist = calculate_distance_meters(
+                                            drone_state['true_position']['lat'],
+                                            drone_state['true_position']['lon'],
+                                            station_lat,
+                                            station_lon
+                                        )
+                                        distances_to_stations.append(true_dist)
+                                
+                                # Средняя сила сигнала
+                                avg_signal = drone_state.get('signal_quality', 0)
+                                
+                                # Отклонение истинной позиции от маршрута (должно быть ~0, так как true_position всегда на маршруте)
+                                # Вычисляем для статистики, но обычно это будет близко к нулю
+                                route_deviation = 0.0
+                                if drone_state.get('route') and idx < len(route) - 1:
+                                    route_start = copy_waypoint(route[idx])
+                                    route_end = copy_waypoint(route[idx + 1])
+                                    route_deviation = calculate_distance_to_route_segment(
+                                        drone_state['true_position'],
+                                        route_start,
+                                        route_end
+                                    )
+                                
+                                # Записываем статистику
+                                write_flight_statistics(
+                                    true_pos=drone_state['true_position'],
+                                    measured_pos=drone_state['position'],
+                                    position_error=position_error,
+                                    num_stations=len(measurements),
+                                    avg_signal=avg_signal,
+                                    distances_to_stations=distances_to_stations,
+                                    route_deviation=route_deviation,
+                                    trilateration_success=True
+                                )
+                            except Exception as e:
+                                # Не прерываем полет из-за ошибки записи статистики
+                                if loop_count % 100 == 0:
+                                    print(f"Warning: Failed to write flight statistics: {e}")
                         else:
                             drone_state['consecutive_failures'] = drone_state.get('consecutive_failures', 0) + 1
                     else:
